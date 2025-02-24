@@ -1,0 +1,9 @@
+[submodule "xenKeycap"]
+	path = xenKeycap
+	url = https://github.com/mcleinn/keycap_playground-freexen
+[submodule "xenSwitch"]
+	path = xenSwitch
+	url = https://github.com/mcleinn/void_switch-freexen
+[submodule "xenSynth"]
+	path = xenSynth
+	url = https://github.com/mcleinn/amsynth_multichannel
