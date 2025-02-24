@@ -1,0 +1,14 @@
+! Default
+! Size of map:
+0
+! MIDI range:
+0
+127
+! Middle note:
+72
+! Reference note (MIDI number and frequency in Hz):
+8
+27.5
+! Scale degree to consider as formal octave:
+24
+! Mapping:

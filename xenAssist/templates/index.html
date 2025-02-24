@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Flask-SocketIO Menu</title>
+    <!-- Load external CSS from /static/hex.css -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='hex.css') }}">
+</head>
+<body>
+    <!-- Toggle Button -->
+    <button id="toggle-menu">Scale</button>
+
+    <!-- Overlay Menu -->
+    <div id="menu-overlay">
+        <ul>
+            {% for item in menu_items %}
+                <li>{{ item[1] }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+
+    <!-- Load Socket.IO client library from CDN -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+	
+    <!-- Load external JS from /static/main.js -->
+    <script type="module" src="{{ url_for('static', filename='main.js') }}"></script>
+	
+	<script type="importmap">
+	{
+	  "imports": {
+		"three": "https://unpkg.com/three@latest/build/three.module.js"
+	  }
+	}
+	</script>
+
+	<!-- Import your Three.js app code as a module -->
+	<script type="module" src="{{ url_for('static', filename='scene.js') }}"></script>
+	
+	
+	<!-- Bottom status bar -->
+	<div id="status-bar">
+	  <div id="status-bar-text"></div>
+	</div>
+
+</body>
+</html>

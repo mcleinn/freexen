@@ -1,0 +1,105 @@
+/* =========== hex.css =========== */
+
+/* 1) Import a modern, sans-serif font. Adjust "Roboto" if you prefer another. */
+@import url('https://fonts.googleapis.com/css?family=Roboto:400,700&display=swap');
+
+/* A global reset, if needed, or at least set the font-family */
+body {
+  margin: 0;
+  overflow: hidden;
+  font-family: 'Roboto', sans-serif; /* Fallback to sans-serif if not loaded */
+}
+
+/* Overlay Menu Styling */
+#menu-overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 300px;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  transform: translateX(100%);
+  transition: transform 0.3s ease;
+  z-index: 9999;
+
+  /* 3) Block pointer events so clicks don't go through */
+  pointer-events: auto;
+}
+
+#menu-overlay.show {
+  transform: translateX(0);
+}
+
+/* Menu Items: left-aligned, with a border around each item */
+#menu-overlay ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  width: 80%;               /* Make this a bit narrower for aesthetics */
+}
+
+#menu-overlay li {
+  margin: 0.5em 0;
+  font-size: 0.9em;
+  cursor: pointer;
+  padding: 0.5em;
+  border: 1px solid #fff;   /* Border around each item */
+  text-align: left;         /* Left-align the text */
+}
+
+/* Highlighted (selected) menu item style */
+#menu-overlay li.selected {
+  background-color: #444;
+  /* You could also change the border color if you want */
+}
+
+#menu-overlay li:hover {
+  background-color: #666; /* Hover color */
+}
+
+/* Toggle Button Styling */
+#toggle-menu {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 10000;
+  background: #222;
+  color: #fff;
+  border: none;
+  padding: 0.5em 1em;
+  font-size: 1em;
+  cursor: pointer;
+  font-family: 'Roboto', sans-serif;
+}
+
+#status-bar {
+  position: fixed;
+  bottom: 0;        /* anchored at the bottom of the screen */
+  left: 0;
+  right: 0;
+  height: 30vh;     /* for example, 30% of viewport height */
+  background: rgba(0, 0, 0, 0.8);
+  display: none;    /* hidden by default */
+  z-index: 9998;    /* ensure it’s above the canvas (and below your top menu if desired) */
+  overflow: hidden; /* so text doesn’t spill over */
+  text-align: center;
+}
+
+/* The text container inside the status bar */
+#status-bar-text {
+  /* Use the same font as the rest of your app, or whichever you prefer: */
+  font-family: 'Roboto', sans-serif;
+  text-align: center;
+  white-space: nowrap; /* keep the text on one line */
+  color: #fff;
+  line-height: 30vh;   /* vertically center text if we’re using 30vh bar */
+  display: inline-block;  /* So it shrinks to fit its content */
+  width: auto;            /* No fixed or 100% width */
+  white-space: nowrap;    /* If you don't want it to break lines */
+  font-size: 160px;     /* an initial large size (we’ll auto-scale down in JS) */
+}
