@@ -1,0 +1,18 @@
+:q>qt]
+Description=Run tun.py script before starting modep-mod-ui
+Before=modep-mod-ui.service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/patch/xenassist
+ExecStart=/usr/local/bin/python3.12 /home/patch/xenassist/server.py
+StandardOutput=append:/var/log/tun-script.log
+StandardError=append:/var/log/tun-script.log
+Restart=always
+User=patch
+Group=patch
+
+[Install]
+WantedBy=multi-user.target
+
