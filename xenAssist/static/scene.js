@@ -332,7 +332,7 @@ export function highlightHex(keys, color) {
 	  keys.forEach(([keyToHighlight, channelToHighlight]) => {
 		//console.log(`Key: ${layout[key]["Key"]}, Channel: ${layout[key]["Chan"]}`);
 		//console.log(`Key: ${String(keyToHighlight)}, Channel: ${String(channelToHighlight)}`);
-		if (layout[key]["Chan"] === channelToHighlight && layout[key]["Key"] === keyToHighlight) {
+		if (layout[key]["Chan"] === (channelToHighlight+1) && layout[key]["Key"] === keyToHighlight) {
 			console.log(`Key: ${keyToHighlight}, Channel: ${channelToHighlight} set to ${color}`);
 			if (!color)
 				hex.material.color.set("#"+layout[key]["Col"].slice(-6));

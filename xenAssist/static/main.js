@@ -31,11 +31,11 @@ function fetchAndApplyLayout(index) {
 function selectFirstItemInitially() {
   if (menuItems.length > 0) {
     // Mark it as selected (UI highlight)
-    menuItems[0].classList.add('selected');
-    selectedMenuItem = menuItems[0];
+    menuItems[7].classList.add('selected');
+    selectedMenuItem = menuItems[7];
 
     // Also fetch layout for index=0
-    fetchAndApplyLayout(0);
+    fetchAndApplyLayout(7);
   }
 }
 
