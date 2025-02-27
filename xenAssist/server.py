@@ -1,4 +1,7 @@
 import re, os
+import atexit
+import signal
+import threading
 import mtsespy as mts # type: ignore
 import rtmidi  # type: ignore
 from rtmidi.midiconstants import PROGRAM_CHANGE  # type: ignore
@@ -10,6 +13,8 @@ from xenharmlib import UpDownNotation
 from collections import defaultdict
 
 LTN_DIRECTORY = "../xen2/ltn"
+NOTE_ON = 0x90
+NOTE_OFF = 0x80
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'  # Required by Flask-SocketIO
@@ -29,10 +34,16 @@ MENU_ITEMS = [
 ]
 
 KEYS_PER_BOARD = 56
+OCTAVE_OFFSET = 1
 
 ltn = {}
+divisions = {}
+edos = {}
+tuning = defaultdict(lambda: defaultdict(dict))
+mts_clients = 0
+
 # Keep track of the most recently forced index (if any)
-current_tuning = 0
+current_tuning = 8
 
 @app.route("/")
 def index():
@@ -152,9 +163,12 @@ def xen_layout_change(index):
     
     pc_channel = 0
     program_change_message = [0xC0 | pc_channel, index]
+    if not xen_out.is_port_open():
+        xen_out_open(xen_out)
     xen_out.send_message(program_change_message)
     print("Sent PC1 msg with value {index} to XEN.")
     current_tuning = index
+    apply_frequency_list()
     
 def xen_note_on(key_list, color_string):
     for key in key_list:
@@ -165,6 +179,8 @@ def xen_note_on(key_list, color_string):
                 value1_split + value2_split + value3_split +  # Split color values
             [0xF7]  # End of SysEx
         )
+        if not xen_out.is_port_open():
+            xen_out_open(xen_out)
         xen_out.send_message(sysex_message)
     print(f"Sent NoteON msgs {key_list} to XEN.")
     
@@ -174,6 +190,8 @@ def xen_note_off(key_list):
         sysex_message = (
             [0xF0, 0x7D, 4, board_number & 0x7f, control_number & 0x7F, 0xF7]  # End of SysEx
         )
+        if not xen_out.is_port_open():
+            xen_out_open(xen_out)
         xen_out.send_message(sysex_message)
     print(f"Sent NoteOFF msgs {key_list} to XEN.")
     
@@ -212,28 +230,29 @@ def parse_file(file_path):
 
     return dict(config)
     
-def calculate_pitches(ltn, edo, scale_size, n_edo):
+def calculate_pitches(ltn, edo, number_divisions, n_edo, tuning_number):
     for board_name, entries in ltn.items():
         board_number = int(board_name[5:])
         for control_number, entry in entries.items():
             if not isinstance(entry, dict):
                 #print(f"Skipping invalid entry: {entry} (type: {type(entry)})")
                 continue 
-                
-            chan = int(entry["Chan"])
-            key = int(entry["Key"])
-            pitch = chan * scale_size + key
+                              
+            midi_chan = int(entry["Chan"])
+            midi_note = int(entry["Key"])
+            tuning[tuning_number][midi_chan][midi_note] = entry
+            
+            pitch = (midi_chan + OCTAVE_OFFSET) * number_divisions + midi_note 
             ep = edo.pitch(pitch)
             note = n_edo.guess_note(ep)
+            freq = edo.get_frequency(ep)
             
             entry["Pitch"] = pitch
             entry["Note"] = note.short_repr
             entry["Class"] = ep.pc_index
             entry["Base"] = ep.bi_index
-            #print( f"{control_number}: Chan {chan} Key {key} Pitch {pitch} Class {ep.pc_index} BaseInt {ep.bi_index} Note {note.short_repr}")
-
-
-        
+            entry["Freq"] = freq.to_float()
+            #print( f"{control_number}: Chan {chan} Key {key} Pitch {pitch} Class {ep.pc_index} BaseInt {ep.bi_index} Note {note.short_repr}")      
             
 def list_midi_devices(midiin, print_ports):
     available_ports = midiin.get_ports()
@@ -248,12 +267,12 @@ def list_midi_devices(midiin, print_ports):
 
     return available_ports
     
-def get_port(ports, port_name):
+def get_port(ports, port_name, direction):
     try:
         matches = [i for i, s in enumerate(ports) if (s.startswith(port_name))]
         if matches:
             index = matches[0]
-            print(f"{port_name} at position {index}")
+            print(f"{port_name} {direction} at position {index}")
         else:
             index = -1
             print(f"'{port_name}' not found in the list.")
@@ -272,53 +291,155 @@ def pedal_callback(event, data=None):
     # Check if the message is a Control Change message
     if message[0] == PROGRAM_CHANGE: # ch 1
         pc_value = message[1]
+        xen_layout_change(pc_value)
         current_tuning = pc_value
         print(f"Forcing menu item = {pc_value}")
         socketio.emit("changeScale", pc_value)  # Broadcast to all
         return f"Forced menu item = {pc_value}"
         
-def xen_callback(event, data):
-    message, _ = event  # Extract MIDI message
-    status, note, velocity = message[:3]  # Get first 3 bytes
+def xen_callback(event, data):   
+    global current_tuning
+    try:
+        message, _ = event  # Extract MIDI message
+        status, midi_note, velocity = message[:3]  # Get first 3 bytes
 
-    channel = status & 0x0F  # Extract MIDI channel (0-15)
-    message_type = status & 0xF0  # Extract message type
+        midi_channel = status & 0x0F  # Extract MIDI channel (0-15)
+        message_type = status & 0xF0  # Extract message type
 
-    if message_type == NOTE_ON and velocity > 0:
-        print(f"NOTE ON:  Channel {channel+1}, Note {note}, Velocity {velocity}")
-        if key_number is not None:
-            socketio.emit("noteOn", [[note, channel], "ffcc00"])  # Broadcast to all
-            print("Sent note ON for keys " + keys + " to client")
+        if message_type == NOTE_ON and velocity > 0:
+            try:
+                name = tuning[current_tuning][midi_channel+1][midi_note]["Note"]
+                freq = tuning[current_tuning][midi_channel+1][midi_note]["Freq"]
+                print(f"NOTE ON:  Channel {midi_channel+1}, Note {midi_note}, Velocity {velocity}, Tuning {current_tuning}, Note {name}, Freq {freq}")
+            except KeyError:
+                print(f"NOTE ON:  Channel {midi_channel+1}, Note {midi_note}, Velocity {velocity} - NOT in layout")
+            socketio.emit("noteOn", [[[midi_note, midi_channel]], "ffcc00"])  # Broadcast to all
+            print(f"Sent note ON for keys {midi_note}@{midi_channel} to client")
+            
+        elif message_type == NOTE_OFF or (message_type == NOTE_ON and velocity == 0):
+            print(f"NOTE OFF: Channel {midi_channel+1}, Note {midi_note}, Velocity {velocity}")
+            socketio.emit("noteOff", [[midi_note, midi_channel]])  # Broadcast to all
+            print(f"Sent note OFF for keys {midi_note}@{midi_channel} to client")
+                
+        else: 
+            print(f"Unknown message type {message_type}")
+             
+    except Exception as e:
+        print(f"Exception in xen_callback: {e}")  # Catch and print errors
         
-    elif message_type == NOTE_OFF or (message_type == NOTE_ON and velocity == 0):
-        print(f"NOTE OFF: Channel {channel+1}, Note {note}, Velocity {velocity}")
-        if key_number is not None:
-            socketio.emit("noteOff", [note, channel])  # Broadcast to all
-            print("Sent note OFF for keys " + keys + " to client")
+def apply_frequency_list():
+    """
+    Apply the frequency list to the corresponding MIDI notes.
+    This function is triggered by specific MIDI Control Change messages.
+    """
+    global current_tuning
+    offset = divisions[current_tuning + 1]
+    edo = edos[current_tuning + 1]
+    
+    for midi_ch in range(0,16):
+        mts.clear_note_filter_multi_channel(midi_ch)
+        for midi_note in range(0,128):
+            try:
+                entry = tuning[current_tuning][midi_ch][midi_note]
+                print(f"MIDI {midi_note}@{midi_ch} (in layout) p={entry["Pitch"]} f={entry["Freq"]}")
+            
+                mts.set_multi_channel_note_tuning(entry["Freq"], midi_note, midi_ch)
+            except KeyError:
+                pitch = (midi_ch + OCTAVE_OFFSET) * offset + midi_note
+                ep = edo.pitch(pitch)
+                freq = edo.get_frequency(ep).to_float()
+            
+                #print(f"MIDI {midi_note}@{midi_ch} (NOT in layout) p={pitch} f={freq}")
+                mts.set_multi_channel_note_tuning(freq, midi_note, midi_ch)
+
+def pedal_in_open(pedal_in):
+    ports = list_midi_devices(pedal_in, True)
+    pedal_portnr = get_port(ports, "MidiSport 1x1", "In")
+    if pedal_portnr >= 0:
+        pedal_in.open_port(pedal_portnr)     
+
+def xen_in_open(xen_in):
+    ports = list_midi_devices(xen_in, False)
+    xen_portnr = get_port(ports, "Teensy MIDI", "In")
+    if xen_portnr >= 0:
+        xen_in.open_port(xen_portnr) 
         
-if __name__ == "__main__":
+def xen_out_open(xen_out):
+    ports = list_midi_devices(xen_out, False)
+    xen_portnr = get_port(ports, "Teensy MIDI", "Out")
+    if xen_portnr >= 0:
+        xen_out.open_port(xen_portnr) 
+        
+def check_ports_periodically():
+    while True:
+        if not pedal_in.is_port_open():
+            pedal_in_open(pedal_in)
+        if not xen_in.is_port_open():
+            xen_in_open(xen_in)
+        socketio.sleep(10)  # eventlet or gevent friendly "sleep"
+        
+def check_mts_clients():
+    global mts_clients
+    old_mts_clients = mts_clients
+    mts_clients = mts.get_num_clients()   # type: ignore
+    
+    if old_mts_clients != mts_clients: {
+        print(f"Number of clients: {mts_clients}")
+    }
+    socketio.sleep(1)
+    
+_master_instance = None
+
+def start_master():
+    global _master_instance
+    if _master_instance is not None:
+        return  # Already started
+
+    try:
+        _master_instance = mts.Master()  # effectively calls __init__()
+    except Exception as e:
+        print(f"When trying to register master: {e}")
+        # Ignore—someone else has already registered a master
+        pass
+
+def stop_master():
+    global _master_instance
+    if _master_instance is not None:
+        _master_instance.__exit__(None, None, None)
+        _master_instance = None
+
+
+# If you also rely on signals (SIGINT, SIGTERM), you can manually handle them:
+def handle_sigterm(signum, frame):
+    stop_master()
+    # If you want to fully exit the Python process:
+    import sys
+    sys.exit(0)
+    
+        
+if __name__ == "__main__":  
+    # Use atexit to ensure clean deregistration on normal interpreter exit
+    atexit.register(stop_master)
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, handle_sigterm)
+        signal.signal(signal.SIGINT, handle_sigterm)
+        
+    start_master()
+        
     # Open Pedals
     pedal_in = rtmidi.MidiIn()
-    ports = list_midi_devices(pedal_in, True)
-    pedal_portnr = get_port(ports, "MidiSport 1x1")
-    if pedal_portnr >= 0:
-        pedal_in.open_port(pedal_portnr) 
-    pedal_in.set_callback(pedal_callback)
+    pedal_in_open(pedal_in)
+    pedal_in.set_callback(pedal_callback) 
        
     # Open Xen In
     xen_in = rtmidi.MidiIn()
-    ports = list_midi_devices(xen_in, False)
-    xen_portnr = get_port(ports, "Teensy MIDI")
-    if xen_portnr >= 0:
-        xen_portnr.open_port(xen_portnr) 
+    xen_in_open(xen_in)
     xen_in.set_callback(xen_callback)
          
     # Open Xen Out
     xen_out = rtmidi.MidiOut()
-    ports = list_midi_devices(xen_out, False)
-    xen_portnr = get_port(ports, "Teensy MIDI")
-    if xen_portnr >= 0:
-        xen_portnr.open_port(xen_portnr) 
+    xen_out_open(xen_out)
         
     # Load LTN
     for id, label, ltn_file, edo_divisions in MENU_ITEMS:
@@ -326,10 +447,14 @@ if __name__ == "__main__":
         if not os.path.exists(ltn_file_abs):
             sys.exit(f"Error: LTN File '{ltn_file_abs}' does not exist. Exiting program.")
             
-        ltn[id] = parse_file(ltn_file_abs)    
-        edo = EDOTuning(edo_divisions)
-        n_edo = UpDownNotation(edo) 
-        calculate_pitches(ltn[id], edo, edo_divisions, n_edo)
-    
+        ltn[id] = parse_file(ltn_file_abs) 
+        divisions[id] = edo_divisions
+        edos[id] = EDOTuning(edo_divisions)
+        n_edo = UpDownNotation(edos[id]) 
+        calculate_pitches(ltn[id], edos[id], divisions[id], n_edo, id-1)
+
+    socketio.start_background_task(check_mts_clients)
+    socketio.start_background_task(check_ports_periodically)   
+
     # Listen on port 8080
-    socketio.run(app, host="0.0.0.0", port=8080, debug=True)
+    socketio.run(app, host="0.0.0.0", port=8080, debug=True, allow_unsafe_werkzeug=True)
