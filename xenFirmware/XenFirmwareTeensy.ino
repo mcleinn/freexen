@@ -37,7 +37,8 @@ const int _muxPerTopMux[NUM_TOP_MUX] = { 12, 12 };
 // XEN
 
 #define NUM_BOARDS 5
-#define NUM_KEYS 112
+#define NUM_KEYS 280
+#define NUM_KEYS_FOR_INPUT 112
 #define NUM_KEYS_PER_BOARD 56
 
 typedef struct {
@@ -49,7 +50,7 @@ typedef struct {
 } XenField;
 
 XenField _fields[NUM_BOARDS][NUM_KEYS_PER_BOARD];
-byte _program = 0;
+byte _program = 7;
 
 // LED
 
@@ -95,6 +96,7 @@ int _gain[NUM_KEYS];
 int _offset[NUM_KEYS];
 float _maxSwing[NUM_KEYS];
 short _polarization[NUM_KEYS];
+bool _manualCalibration = false;
 
 // SYSEX AND MTS
 
@@ -119,6 +121,8 @@ void setup() {
   setupMidi();
 
   loadConfigurationCSV();
+  updateLEDs();
+
   mts_loadTuning();
   mts_sendTuning();
 }
@@ -161,7 +165,8 @@ void updateLEDs() {
   // Turn the LED on, then pause
   int l = 0;
   for (int b = 0; b < NUM_BOARDS; b++) {
-    for (int c = 0; c < NUM_KEYS_PER_BOARD; c++) {
+    for (int c = 0; c < NUM_KEYS_PER_BOARD; c++) {    
+      //_println("UPD [%d] %d %d %d", l, _fields[b][c].Color.r, _fields[b][c].Color.g, _fields[b][c].Color.b);
       _leds[l++] = _fields[b][c].Color;
     }
     if (l >= NUM_KEYS) break;
@@ -193,7 +198,7 @@ void loopNormal() {
     Serial.print("Min:");
     Serial.print(0);
   }
-  for (int key=0; key<NUM_KEYS; key++) {
+  for (int key=0; key<NUM_KEYS_FOR_INPUT; key++) {
     setKey(key);
     mainDAC(_offset[key], 0); // set zeroPoint to center  
     delayMicroseconds(30);
@@ -223,13 +228,24 @@ void midiHandleSystemEx(const byte *data, uint16_t length, bool last) {
   if (last) {
     Serial.println(" (end)");
 
-    int command = (int8_t)(data[2]) % 112;
+    int command = (int8_t)(data[2]);
     if (command == 0) 
         sysEx_saveAndUpdate();
     else if (command == 1)
         sysEx_setField(data, length);
     else if (command == 2)
         mts_receiveTuning(data, length);
+    else if (command == 3 || command == 4)
+        sysEx_noteOnOff(command, data, length);
+    else if (command == 5) { 
+        for (int i=0; i < NUM_KEYS; i++)
+          _leds[i] = CRGB::Blue;
+        FastLED.show();
+        _loopState = STATE_CALIBRATION_START;
+        _manualCalibration = true;
+    } else if (command == 6) {
+        sysEx_update();
+    }
   } else {
     Serial.println(" (to be continued)");
   }
@@ -365,9 +381,14 @@ void sysEx_saveAndUpdate() {
   updateLEDs();
 }
 
+void sysEx_update() {
+  updateLEDs();
+}
+
+
 void sysEx_setField(const byte *data, uint16_t length) {
-    int board = (byte)(data[3]) % 112;
-    int boardKey = (byte)(data[4]) % 112;
+    int board = (byte)(data[3]);
+    int boardKey = (byte)(data[4]);
 
     if (board > NUM_BOARDS) {
       Serial.print("Board index too high: ");
@@ -380,8 +401,8 @@ void sysEx_setField(const byte *data, uint16_t length) {
       return;
     }
 
-    int channel = (byte)(data[5]) % 112;
-    int note = (byte)(data[6]) % 112;
+    int channel = (byte)(data[5]);
+    int note = (byte)(data[6]);
 
     Serial.print("SET [");
     Serial.print(board);
@@ -398,16 +419,48 @@ void sysEx_setField(const byte *data, uint16_t length) {
     _fields[board][boardKey].Color.green = mergeBytes(data[11], data[12]);
     _fields[board][boardKey].Color.blue = mergeBytes(data[7], data[8]);
 
-    Serial.print(" ");
-    Serial.print(note);
-    Serial.print("@");
-    Serial.print(channel);
-    
-    Serial.print(" #");
-    printBytes(_fields[board][boardKey].Color.raw, 3);
-    Serial.println();
+    _leds[board * NUM_KEYS_PER_BOARD + boardKey] = _fields[board][boardKey].Color;
+    FastLED.show();
 }
 
+void sysEx_noteOnOff(int command, const byte *data, uint16_t length) {
+    int board = (byte)(data[3]);
+    int boardKey = (byte)(data[4]);
+
+    if (board > NUM_BOARDS) {
+      Serial.print("Board index too high: ");
+      Serial.println(NUM_BOARDS);
+      return;
+    }
+    if (boardKey > NUM_KEYS_PER_BOARD) {
+      Serial.print("BoardKey index too high: ");
+      Serial.println(NUM_KEYS_PER_BOARD);
+      return;
+    }
+
+    int key = board * NUM_KEYS_PER_BOARD + boardKey;
+
+    Serial.print("HIGHLIGHT [");
+    Serial.print(board);
+    
+    Serial.print("-");
+    Serial.print(boardKey);
+    Serial.print("] ");
+    
+    //_fields[board][boardKey].Board = board;
+    //_fields[board][boardKey].BoardKey = boardKey;
+    if (command == 3) {
+      struct CRGB highlightColor;
+      highlightColor.red = mergeBytes(data[7], data[8]);
+      highlightColor.green = mergeBytes(data[9], data[10]);
+      highlightColor.blue = mergeBytes(data[5], data[6]);
+      _leds[key] = highlightColor;
+      FastLED.show();
+    }
+    if (command == 4) {
+      updateLEDs();
+    }
+}
 
 void saveConfigurationCSV() {
     char filename[255];
@@ -483,8 +536,10 @@ void loadConfigurationCSV() {
             nextPos = line.indexOf(',', lastPos);
             field.Color.b = (byte)line.substring(lastPos, nextPos).toInt();
             
-            if (field.Board >= 0 && field.Board < NUM_BOARDS && field.Board >= 0 && field.BoardKey < NUM_KEYS_PER_BOARD)
+            if (field.Board >= 0 && field.Board < NUM_BOARDS && field.Board >= 0 && field.BoardKey < NUM_KEYS_PER_BOARD) {
               _fields[field.Board][field.BoardKey] = field;
+              //_println("[%d] %d %d %d", field.Board * 56 + field.BoardKey, field.Color.r, field.Color.g, field.Color.b);
+            }
         }
         configFile.close();
         Serial.println("CSV configuration loaded.");
@@ -801,8 +856,9 @@ void performance_test()
 
 // CALIB
 void loopCalibrationStart() {
-  bool ok = loadCalibrationCSV();
-  //ok = false;
+  bool ok = !_manualCalibration && loadCalibrationCSV();
+  _manualCalibration = false;
+  
   if (ok) { 
     analogReadAveraging(32);
     updateLEDs();
@@ -879,7 +935,7 @@ void loopCalibrationOn() {
         _polarization[_currentCalibrationKey]);
 
     _leds[_currentCalibrationKey] = CRGB::Black;
-    if (_currentCalibrationKey < NUM_KEYS - 1) {
+    if (_currentCalibrationKey < NUM_KEYS_FOR_INPUT - 1) {
       _currentCalibrationKey++;
       _loopState = STATE_CALIBRATION_OFF;
     } else
