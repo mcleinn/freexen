@@ -1,9 +1,12 @@
 import re, os
 import atexit
 import signal
+import time
 import threading
 import mtsespy as mts # type: ignore
 import rtmidi  # type: ignore
+import re
+import json
 from rtmidi.midiconstants import PROGRAM_CHANGE  # type: ignore
 from flask import Flask, request, render_template, jsonify
 from flask_socketio import SocketIO, emit
@@ -39,11 +42,50 @@ OCTAVE_OFFSET = 1
 ltn = {}
 divisions = {}
 edos = {}
-tuning = defaultdict(lambda: defaultdict(dict))
+tuningByMidi = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+tuningByPitch = defaultdict(lambda: defaultdict(list))
 mts_clients = 0
+saved_scale = None
 
 # Keep track of the most recently forced index (if any)
-current_tuning = 8
+current_tuning = 7
+
+notation_replacements = {
+        '^':    '',
+        '^^':   '',
+        '^^^':  '',
+        'vvv#': '',
+        'vv#':  '',
+        'v#':   '',
+        '#':    '',
+        '^#':   '',
+        '^^#':  '',
+        '^^^#': '',
+        'vvvx': '',
+        'vvx':  '',
+        'vx':   '',
+        'x':    '',
+        '^x':   '',
+        '^^x':  '',
+        '^^^x': '',
+        'v':    '',
+        'vv':   '',
+        'vvv':  '',
+        '^^^b': '',
+        '^^b':  '',
+        '^b':   '',
+        'b':    '',
+        'vb':   '',
+        'vvb':  '',
+        'vvvb': '',
+        '^^^bb':'',
+        '^^bb': '',
+        '^bb':  '',
+        'bb':   '',
+        'vbb':  '',
+        'vvbb': '',
+        'vvvbb':''
+}
 
 @app.route("/")
 def index():
@@ -95,7 +137,7 @@ def note_on():
         key_list = keystring_to_list(keys)
         xen_note_on(key_list, color)
         print(f"Sending note ON to client for {key_list}")
-        socketio.emit("noteOn", [ key_list, color ])  # Broadcast to all
+        socketio.emit("noteOn", [ key_list, color, True ])  # Broadcast to all
         return f"Sending note ON to client for {key_list}"
         
     return "No index provided"
@@ -107,7 +149,8 @@ def note_off():
         key_list = keystring_to_list(keys)
         xen_note_off(key_list)
         print(f"Sending note OFF to client for {key_list}")
-        socketio.emit("noteOff", key_list)  # Broadcast to all
+        socketio.emit("noteOff", [ key_list, True ])  # Broadcast to all
+        show_saved_scale()
         return f"Sending note OFF to client for {key_list}"
         
     return "No index provided"
@@ -133,7 +176,136 @@ def get_layout():
 @socketio.on("connect")
 def on_connect():
     print("A client connected via Socket.IO")
+    
 
+@app.route('/rotateInterval')
+def rotate_interval():
+    global current_tuning, saved_scale
+    
+    # Get the pitches parameter (should be a JSON string)
+    pitches_str = request.args.get('pitches')
+    direction = int(request.args.get('direction'))
+    
+    pitch_list = json.loads(pitches_str) if pitches_str else []
+    # Ensure all items are integers.
+    pitch_array = [int(x) for x in pitch_list]
+       
+    # Log the incoming parameter
+    print("saveInterval called with pitches:", pitch_array)  
+    
+    t = current_tuning + 1 
+    if saved_scale is None:
+        previous_scale = edos[t].scale(
+            [edos[t].pitch(p) for p in pitch_list]
+        )
+    else: 
+        previous_scale = saved_scale
+        hide_saved_scale()
+        
+    if direction == -1 and len(previous_scale) > 1:
+        saved_scale = previous_scale.rotated_down()
+    if direction == 1 and len(previous_scale) > 1:
+        saved_scale = previous_scale.rotated_up()
+        
+    show_saved_scale()
+    # Return a stub response
+    return jsonify({
+        "status": "ok",
+        "message": f"rotateInterval called with direction {direction}"
+    })
+
+@app.route('/saveInterval')
+def save_interval():
+    global current_tuning, saved_scale
+    
+    # Get the pitches parameter (should be a JSON string)
+    pitches_str = request.args.get('pitches')
+    
+    pitch_list = json.loads(pitches_str) if pitches_str else []
+    # Ensure all items are integers.
+    pitch_array = [int(x) for x in pitch_list]
+   
+    # Log the incoming parameter
+    print("saveInterval called with pitches:", pitch_array)
+    
+    t = current_tuning + 1
+    new_saved_scale = edos[t].scale(
+        [edos[t].pitch(p) for p in pitch_list]
+    ) 
+      
+    if saved_scale is None:   
+        print("No previous saved scale. New scale: ", saved_scale)
+    else:
+        print("There was a previous saved scale. New scale: ", saved_scale)
+        hide_saved_scale()
+    
+    if not new_saved_scale is None:
+        saved_scale = new_saved_scale
+        show_saved_scale()
+    
+    # Return a stub response
+    return jsonify({
+        "status": "ok",
+        "message": "saveInterval OK",
+        "pitches": pitch_array
+    })
+
+@app.route('/sendSavedNotes')
+def sendSavedNotes():
+    show_saved_scale()
+    
+    return jsonify({
+    "status": "ok",
+    "message": "sendSavedNotes OK"
+    })
+    
+def hide_saved_scale():
+    global saved_scale
+    if saved_scale is None:
+        return 
+    print("Hide the following scale: ", saved_scale)
+    key_list = key_tuple_from_scale(saved_scale)
+    xen_note_off(key_list)
+    socketio.emit("noteOff", [ key_list, False ])
+    saved_scale = None
+    
+def show_saved_scale():
+    global saved_scale
+    if saved_scale is None:
+        return 
+    print("Show the following scale: ", saved_scale)
+    key_list = key_tuple_from_scale(saved_scale)
+    print("Note string: ", key_list)
+    socketio.emit("noteOn", [ key_list, "ffcc00", False ])
+    xen_note_on(key_list, "ffcc00")
+    
+def key_tuple_from_scale(scale):
+    if scale is None:
+        return []
+
+    keys = []
+    for pitch in scale:
+        result = get_tuple_from_pitch(pitch)  # This returns a list of tuples or None
+        if result is not None:
+            # Extend our 'keys' list by adding all tuples from 'result'
+            keys.extend(result)
+    return keys
+    
+def get_tuple_from_pitch(pitch):
+    global current_tuning 
+    t = current_tuning 
+    if pitch.pitch_index in tuningByPitch[t]:
+        print("Pitch "+str(pitch.pitch_index)+" found in current tuning.")
+        print(tuningByPitch[t][pitch.pitch_index])
+        return [
+            (entry["Key"], entry["Chan"] - 1)
+            for entry in tuningByPitch[t][pitch.pitch_index]
+        ]
+    else:
+        print(list(tuningByPitch[t].items())[:10])
+        print("Pitch "+str(pitch.pitch_index)+" NOT found in current tuning.")
+    return None 
+    
 def split_byte(byte_value):
     """
     Splits a byte into two 7-bit values for SysEx transmission.
@@ -159,41 +331,62 @@ def bytes_from_color(color):
     return value1_split, value2_split, value3_split
     
 def xen_layout_change(index):
-    global current_tuning
+    global current_tuning, saved_scale
+    
+    old_scale = saved_scale
+    hide_saved_scale()
     
     pc_channel = 0
     program_change_message = [0xC0 | pc_channel, index]
     if not xen_out.is_port_open():
         xen_out_open(xen_out)
-    xen_out.send_message(program_change_message)
-    print("Sent PC1 msg with value {index} to XEN.")
+    if xen_out.is_port_open():
+        xen_out.send_message(program_change_message)
+    print(f"Sent PC1 msg with value {index} to XEN.")
     current_tuning = index
     apply_frequency_list()
     
+    if not old_scale is None:          
+        saved_scale = old_scale.retune(edos[index + 1])
+        print(f"Old scale: {old_scale} Retuned scale: {saved_scale}")
+    
 def xen_note_on(key_list, color_string):
+    global current_tuning
     for key in key_list:
-        board_number, control_number = key
-        value1_split, value2_split, value3_split = bytes_from_color(color_string)
-        sysex_message = (
-            [0xF0, 0x7D, 3, board_number & 0x7f, control_number & 0x7F] +  # SysEx header and InputKey
-                value1_split + value2_split + value3_split +  # Split color values
-            [0xF7]  # End of SysEx
-        )
-        if not xen_out.is_port_open():
-            xen_out_open(xen_out)
-        xen_out.send_message(sysex_message)
-    print(f"Sent NoteON msgs {key_list} to XEN.")
+        midi_note, midi_channel = key
+        try:
+            layout_list = tuningByMidi[current_tuning][midi_channel+1][midi_note]
+            for layout in layout_list:
+                value1_split, value2_split, value3_split = bytes_from_color(color_string)
+                sysex_message = (
+                    [0xF0, 0x7D, 3, layout["Board"] & 0x7f, layout["Control"] & 0x7F] +  # SysEx header and InputKey
+                        value1_split + value2_split + value3_split +  # Split color values
+                    [0xF7]  # End of SysEx
+                )
+                if not xen_out.is_port_open():
+                    xen_out_open(xen_out)
+                if xen_out.is_port_open():
+                    xen_out.send_message(sysex_message)
+                print(f"Sent NoteON msgs {key_list} to XEN board {layout["Board"]}, control {layout["Control"]}. Layout list: {layout_list}.")
+        except Exception:
+            print(f"Could not find {midi_note}@{midi_channel} in tuning {current_tuning}.")
     
 def xen_note_off(key_list):
     for key in key_list:
-        board_number, control_number = key
-        sysex_message = (
-            [0xF0, 0x7D, 4, board_number & 0x7f, control_number & 0x7F, 0xF7]  # End of SysEx
-        )
-        if not xen_out.is_port_open():
-            xen_out_open(xen_out)
-        xen_out.send_message(sysex_message)
-    print(f"Sent NoteOFF msgs {key_list} to XEN.")
+        midi_note, midi_channel = key
+        try:
+            layout_list = tuningByMidi[current_tuning][midi_channel+1][midi_note]
+            for layout in layout_list:
+                sysex_message = (
+                    [0xF0, 0x7D, 4, layout["Board"] & 0x7f, layout["Control"] & 0x7F, 0xF7]  # End of SysEx
+                )
+                if not xen_out.is_port_open():
+                    xen_out_open(xen_out)
+                if xen_out.is_port_open():
+                    xen_out.send_message(sysex_message)
+                print(f"Sent NoteOFF msgs {key_list} to XEN board {layout["Board"]}, control {layout["Control"]}.")
+        except Exception:
+            print(f"Could not find {midi_note}@{midi_channel} in tuning {current_tuning}.")
     
 def keystring_to_list(numbers_str):
     try:
@@ -230,6 +423,15 @@ def parse_file(file_path):
 
     return dict(config)
     
+def encode_notation(s):
+    m = re.match(r'^([v\^]*)([A-Z])([#xb]+)?(\d+)?$', s)
+    if not m: return s
+    prefix, note, suffix, octave = m.groups()
+    suffix = suffix or ''
+    octave = octave or ''
+    key = prefix + suffix
+    return note + notation_replacements.get(key, '') + octave
+    
 def calculate_pitches(ltn, edo, number_divisions, n_edo, tuning_number):
     for board_name, entries in ltn.items():
         board_number = int(board_name[5:])
@@ -237,10 +439,12 @@ def calculate_pitches(ltn, edo, number_divisions, n_edo, tuning_number):
             if not isinstance(entry, dict):
                 #print(f"Skipping invalid entry: {entry} (type: {type(entry)})")
                 continue 
-                              
+            
+            entry["Board"] = int(board_number)
+            entry["Control"] = int(control_number)               
             midi_chan = int(entry["Chan"])
             midi_note = int(entry["Key"])
-            tuning[tuning_number][midi_chan][midi_note] = entry
+            tuningByMidi[tuning_number][midi_chan][midi_note].append(entry)
             
             pitch = (midi_chan + OCTAVE_OFFSET) * number_divisions + midi_note 
             ep = edo.pitch(pitch)
@@ -248,10 +452,14 @@ def calculate_pitches(ltn, edo, number_divisions, n_edo, tuning_number):
             freq = edo.get_frequency(ep)
             
             entry["Pitch"] = pitch
+            tuningByPitch[tuning_number][pitch].append(entry)
+            
             entry["Note"] = note.short_repr
+            entry["NoteUnicode"] = encode_notation(note.short_repr)
             entry["Class"] = ep.pc_index
             entry["Base"] = ep.bi_index
             entry["Freq"] = freq.to_float()
+            
             #print( f"{control_number}: Chan {chan} Key {key} Pitch {pitch} Class {ep.pc_index} BaseInt {ep.bi_index} Note {note.short_repr}")      
             
 def list_midi_devices(midiin, print_ports):
@@ -308,18 +516,20 @@ def xen_callback(event, data):
 
         if message_type == NOTE_ON and velocity > 0:
             try:
-                name = tuning[current_tuning][midi_channel+1][midi_note]["Note"]
-                freq = tuning[current_tuning][midi_channel+1][midi_note]["Freq"]
+                name = tuningByMidi[current_tuning][midi_channel+1][midi_note][0]["Note"]
+                freq = tuningByMidi[current_tuning][midi_channel+1][midi_note][0]["Freq"]
                 print(f"NOTE ON:  Channel {midi_channel+1}, Note {midi_note}, Velocity {velocity}, Tuning {current_tuning}, Note {name}, Freq {freq}")
             except KeyError:
                 print(f"NOTE ON:  Channel {midi_channel+1}, Note {midi_note}, Velocity {velocity} - NOT in layout")
-            socketio.emit("noteOn", [[[midi_note, midi_channel]], "ffcc00"])  # Broadcast to all
+            socketio.emit("noteOn", [[[midi_note, midi_channel]], "ffcc00", True])  # Broadcast to all
             print(f"Sent note ON for keys {midi_note}@{midi_channel} to client")
+            show_saved_scale()
             
         elif message_type == NOTE_OFF or (message_type == NOTE_ON and velocity == 0):
             print(f"NOTE OFF: Channel {midi_channel+1}, Note {midi_note}, Velocity {velocity}")
-            socketio.emit("noteOff", [[midi_note, midi_channel]])  # Broadcast to all
+            socketio.emit("noteOff", [[[midi_note, midi_channel]], True])  # Broadcast to all
             print(f"Sent note OFF for keys {midi_note}@{midi_channel} to client")
+            show_saved_scale()
                 
         else: 
             print(f"Unknown message type {message_type}")
@@ -340,11 +550,11 @@ def apply_frequency_list():
         mts.clear_note_filter_multi_channel(midi_ch)
         for midi_note in range(0,128):
             try:
-                entry = tuning[current_tuning][midi_ch][midi_note]
+                entry = tuningByMidi[current_tuning][midi_ch][midi_note][0]
                 print(f"MIDI {midi_note}@{midi_ch} (in layout) p={entry["Pitch"]} f={entry["Freq"]}")
             
                 mts.set_multi_channel_note_tuning(entry["Freq"], midi_note, midi_ch)
-            except KeyError:
+            except Exception:
                 pitch = (midi_ch + OCTAVE_OFFSET) * offset + midi_note
                 ep = edo.pitch(pitch)
                 freq = edo.get_frequency(ep).to_float()

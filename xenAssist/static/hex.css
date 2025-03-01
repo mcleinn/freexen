@@ -77,6 +77,20 @@ body {
   font-family: 'Roboto', sans-serif;
 }
 
+@font-face {
+  font-family: 'Bravura';
+  src: url('/static/fonts/Bravura.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: 'Bravura Text';
+  src: url('/static/fonts/BravuraText.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+}
+
 #status-bar {
   position: fixed;
   bottom: 0;        /* anchored at the bottom of the screen */
@@ -93,7 +107,7 @@ body {
 /* The text container inside the status bar */
 #status-bar-text {
   /* Use the same font as the rest of your app, or whichever you prefer: */
-  font-family: 'Roboto', sans-serif;
+  font-family: 'Bravura', sans-serif;
   text-align: center;
   white-space: nowrap; /* keep the text on one line */
   color: #fff;
@@ -101,5 +115,111 @@ body {
   display: inline-block;  /* So it shrinks to fit its content */
   width: auto;            /* No fixed or 100% width */
   white-space: nowrap;    /* If you don't want it to break lines */
+  pointer-events: none;
   font-size: 160px;     /* an initial large size (we’ll auto-scale down in JS) */
+}
+
+/* Container for the pitch class switch */
+#pitchClass-switch-container {
+  position: fixed;
+  top: 70px; /* Adjust so it's below the toggle-menu button */
+  right: 20px;
+  z-index: 10000; /* Ensure it's on top of the renderer */
+  background: transparent; /* Remove the white background */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Container for interval switch */
+#interval-switch-container {
+  position: fixed;
+  top: 120px; /* Adjust so it's below the toggle-menu button */
+  right: 20px;
+  z-index: 10000; /* Ensure it's on top of the renderer */
+  background: transparent; /* Remove the white background */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Style for the labels */
+.toggle-label {
+  font-family: 'Roboto', sans-serif;  /* Use a modern sans-serif */
+  font-size: 1em;
+  color: #333;
+}
+
+/* The switch styling */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 60px;
+  height: 34px;
+  margin: 0 10px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+/* The slider */
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0;
+  right: 0; bottom: 0;
+  background-color: #ccc;
+  transition: 0.4s;
+  border-radius: 34px;
+}
+
+/* The knob */
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 26px;
+  width: 26px;
+  left: 4px;
+  bottom: 4px;
+  background-color: white;
+  transition: 0.4s;
+  border-radius: 50%;
+}
+
+/* When toggled on */
+input:checked + .slider {
+  background-color: #2196F3;
+}
+
+input:checked + .slider:before {
+  transform: translateX(26px);
+}
+
+.flash-effect {
+  position: absolute;
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background-color: rgba(255, 255, 255, 0.8); /* semi-transparent white flash */
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  animation: flashAnim 0.5s ease-out forwards;
+}
+
+@keyframes flashAnim {
+  from {
+    opacity: 1;
+    transform: scale(1) translate(-50%, -50%);
+  }
+  to {
+    opacity: 0;
+    transform: scale(4) translate(-50%, -50%);
+  }
+}
+
+canvas {
+  cursor: auto; /* or any custom cursor style you prefer */
 }

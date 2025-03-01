@@ -82,7 +82,18 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.05;
 controls.minDistance = 5;
 controls.maxDistance = 30;
+controls.panSpeed = 1.0; 
 controls.enablePan = true;
+controls.enableRotate = false;
+controls.screenSpacePanning = true;
+controls.mouseButtons = {
+  LEFT: undefined,    // Left mouse button pans
+  MIDDLE: THREE.MOUSE.DOLLY, // Middle mouse button zooms/dolies
+  RIGHT: THREE.MOUSE.PAN     // Right mouse button also pans
+};
+
+renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
+
 
 // Lighting
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
@@ -233,55 +244,110 @@ hexGrid.position.y = (rows * hexHeight / 2) * 0.5;
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
 
-function pickHex(event) {
-	// Prevent default on touch so the browser doesn’t treat it as a gesture/scroll
-	if (event.type === 'touchstart') {
-	  event.preventDefault();
-	}
-
-	let clientX, clientY;
-	if (event.touches) {
-	  // Touch event: use the first touch’s coords
-	  clientX = event.touches[0].clientX;
-	  clientY = event.touches[0].clientY;
-	} else {
-	  // Mouse event
-	  clientX = event.clientX;
-	  clientY = event.clientY;
-	}
-
-	mouse.x = (clientX / window.innerWidth) * 2 - 1;
-	mouse.y = -(clientY / window.innerHeight) * 2 + 1;
-
-	raycaster.setFromCamera(mouse, camera);
-
-	const intersects = raycaster.intersectObjects(Object.values(hexagons), false);
-	if (intersects.length > 0) {
-		selectedHex = intersects[0].object;
-		selectedHexKey = Object.entries(hexagons).find(([key, val]) => val === selectedHex)?.[0];
-		selectedHex.material.color.set(0x00ff00); // Example: turn hex green on press
-	}
-	
-	// Also hide the menu if open
-	if (menuOverlay.classList.contains('show')) {
-	  menuOverlay.classList.remove('show');
-	}
+// Helper to return an array of points from the event
+function getEventPoints(event) {
+  let points = [];
+  if (event.type.startsWith('touch')) {
+    // For touch events, iterate over changedTouches
+    for (let touch of event.changedTouches) {
+      points.push({
+        clientX: touch.clientX,
+        clientY: touch.clientY,
+        id: touch.identifier
+      });
+    }
+  } else {
+    // For mouse events, use one point with a fixed id ("mouse")
+    points.push({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      id: 'mouse'
+    });
+  }
+  return points;
 }
+
+function pickHex(event) {
+  if (event.type.startsWith('mouse') && event.button !== 0) return;
+  if (event.type.startsWith('touch')) {
+    event.preventDefault();
+  }
+  let points = getEventPoints(event);
+  points.forEach(point => {
+    mouse.x = (point.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(point.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+
+    const intersects = raycaster.intersectObjects(Object.values(hexagons), false);
+    if (intersects.length > 0) {
+      let pressedHex = intersects[0].object;
+      let hexKey = Object.entries(hexagons).find(([key, val]) => val === pressedHex)?.[0];
+      const keyString = layout[hexKey]["Key"] + '@' + (layout[hexKey]["Chan"] - 1);
+	  
+      console.log("Sending noteOn for " + keyString);
+      fetch('/noteOn?keys=' + encodeURIComponent(keyString) + '&color=' + encodeURIComponent("ffffff"), {
+        method: 'GET',
+        cache: 'no-cache'
+      }).catch(err => console.error('Error in noteOn:', err));
+      
+      // Store the pressed hex using the point's unique id
+      if (point.id === 'mouse') {
+        activeMouseHex = { hex: pressedHex, key: hexKey };
+      } else {
+        activeHexes.set(point.id, { hex: pressedHex, key: hexKey });
+      }
+    }
+  });
+
+  // Hide menu if open
+  if (menuOverlay.classList.contains('show')) {
+    menuOverlay.classList.remove('show');
+  }
+}
+
+function sendNoteOff(hexKey) {
+  const keyString = layout[hexKey]["Key"] + '@' + (layout[hexKey]["Chan"] - 1);
+  console.log("Sending noteOff for " + keyString);
+  fetch('/noteOff?keys=' + encodeURIComponent(keyString), {
+    method: 'GET',
+    cache: 'no-cache'
+  }).catch(err => console.error('Error in noteOff:', err));
+}
+
 
 function letgoHex(event) {
-	if (selectedHex) {
-		selectedHex.material.color.set("#"+layout[selectedHexKey]["Col"].slice(-6));
-		selectedHex = null;
-	}
+  if (event.type.startsWith('mouse') && event.button !== 0) return;
+  let points = getEventPoints(event);
+  points.forEach(point => {
+    let hexKey;
+    if (point.id === 'mouse') {
+      if (activeMouseHex) {
+        hexKey = activeMouseHex.key;
+        activeMouseHex = null;
+      }
+    } else {
+      if (activeHexes.has(point.id)) {
+        hexKey = activeHexes.get(point.id).key;
+        activeHexes.delete(point.id);
+      }
+    }
+    if (hexKey !== undefined) {
+      sendNoteOff(hexKey);
+    }
+  });
 }
 
-let selectedHex = null;
-let selectedHexKey = null;
 
+// Global variables for tracking active hex presses:
+let activeHexes = new Map(); // For touch events: key = touch.identifier, value = { hex, key }
+let activeMouseHex = null;   // For mouse events
+
+// Attach event listeners
 renderer.domElement.addEventListener('mousedown', pickHex);
 renderer.domElement.addEventListener('touchstart', pickHex);
 renderer.domElement.addEventListener('mouseup', letgoHex);
 renderer.domElement.addEventListener('touchend', letgoHex);
+
 
 // Animation Loop
 function animate() {
@@ -308,7 +374,29 @@ toggleMenuBtn.addEventListener('click', () => {
   menuOverlay.classList.toggle('show');
 });
 
-export function updateSceneFromData(layoutData) {
+window.addEventListener('resize', onWindowResize, false);
+
+function onWindowResize() {
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  const aspect = width / height;
+  
+  // Update orthographic camera boundaries using your original values
+  camera.left   = -cameraSize * aspect / zoomLevel;
+  camera.right  = cameraSize * aspect / zoomLevel;
+  camera.top    = cameraSize / zoomLevel;
+  camera.bottom = -cameraSize / zoomLevel;
+  camera.updateProjectionMatrix();
+  
+  // Update the renderer
+  renderer.setSize(width, height);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  
+  // Render the scene (if not using a continuous loop)
+  renderer.render(scene, camera);
+}
+
+export function updateSceneFromData(layoutData, pitchClassView, intervalView, updateBackground) {
   // Example usage of layoutData
   //const color = layoutData.hexData.color || "#ffffff";
   //const textOverride = layoutData.hexData.textOverride || "DEF";
@@ -320,8 +408,12 @@ export function updateSceneFromData(layoutData) {
 	  const controlNumber = key % patternKeys;
 	  //console.log("Key " + key + " Board "+board+ " Control "+controlNumber);
 	  layout[key] = layoutData["Board"+board][controlNumber]; 
-	  hex.material.color.set("#"+layout[key]["Col"].slice(-6));
-	  updateHexText(hex, layout[key]["Note"], appFont, 0x000000);
+	  if (updateBackground)
+		hex.material.color.set("#"+layout[key]["Col"].slice(-6));
+	  if (pitchClassView)
+		updateHexText(hex, layout[key]["Class"].toString(), appFont, 0x000000);
+	  else
+		updateHexText(hex, layout[key]["Note"], appFont, 0x000000);
   });
 };
 
@@ -338,9 +430,9 @@ export function highlightHex(keys, color) {
 				hex.material.color.set("#"+layout[key]["Col"].slice(-6));
 			else 
 				hex.material.color.set("#"+color.slice(-6));
-			notes.push(layout[key]["Note"]);
+			notes.push(layout[key]);
 		}
 	  });
-  });
+  })
   return notes;
 }
