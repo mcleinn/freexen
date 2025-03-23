@@ -3,17 +3,18 @@
 #include <SPI.h>
 #include <FastLED.h>
 #include "MCP_DAC.h"
+#include "AD520X.h"
 
 char _charVal[80];
 
 // ADC
 #define NUM_ADCS           4
-#define ADC_MAIN           0
-#define ADC_FIRSTSTAGE     1
-#define ADC_UNUSED         2
-#define ADC_UNSCALED       3
+#define ADC_MAIN1           0
+#define ADC_UNSCALED1       1
+#define ADC_MAIN2           3
+#define ADC_UNSCALED2       4
 
-const short _adcPins[NUM_ADCS] = { A2, A16, A17, A15 };
+const short _adcPins[NUM_ADCS] = { A1, A2, A4, A5 };
 const float ADC_VREF = 3.3;       // Reference voltage in volts
 const int ADC_RESOLUTION = 12;
 const int ADC_RESOLUTION_MAX = 4095;  // 10 bit 1023, 12 bit 4095
@@ -24,7 +25,12 @@ const int DAC_VREF = 5;
 
 // DAC
 #define MAINDAC_CS_PIN    10
-#define OFFSETDAC_CS_PIN  0
+
+// DPot
+#define DPOT_CS_PIN        0
+#define DPOT_RESET_PIN    -1
+#define DPOT_SHUTDOWN_PIN -1
+AD8402 _dpot(DPOT_CS_PIN, DPOT_RESET_PIN, DPOT_SHUTDOWN_PIN, &SPI1);
 
 // MUX
 #define NUM_TOP_MUX        2
@@ -38,6 +44,7 @@ const int _muxPerTopMux[NUM_TOP_MUX] = { 12, 12 };
 
 #define NUM_BOARDS 5
 #define NUM_KEYS 280
+#define NUM_LED_PER_KEY 2
 #define NUM_KEYS_FOR_INPUT 112
 #define NUM_KEYS_PER_BOARD 56
 
@@ -56,7 +63,7 @@ byte _program = 7;
 
 #define DATA_PIN 17
 
-CRGB _leds[NUM_KEYS];
+CRGB _leds[NUM_KEYS * NUM_LED_PER_KEY];
 
 // SD-CARD
 
@@ -116,6 +123,7 @@ void setup() {
   setupMux();
   setupADC();
   setupDAC();
+  setupDPot();
 
   setupLEDs();
   setupMidi();
@@ -152,24 +160,42 @@ byte mergeBytes(byte low, byte high) {
 }
 
 void setupLEDs() {
-  FastLED.addLeds<WS2812B, DATA_PIN, GRB>(_leds, NUM_KEYS);  
+  FastLED.addLeds<WS2812B, DATA_PIN, GRB>(_leds, NUM_KEYS * NUM_LED_PER_KEY);  
 
   // Turn the LED on, then pause
-  for (int i=0; i < NUM_KEYS; i++)
+  for (int i=0; i < NUM_KEYS * NUM_LED_PER_KEY; i++)
     _leds[i] = CRGB::Blue;
   FastLED.show();
+}
+
+// board, key, led number -> unique ledId
+int ledIdFromBoardKey(short b, short k, short l) {
+  if (b >= NUM_BOARDS) {
+    _println("Wrong LED id: board %d, max %d", b, NUM_BOARDS-1);
+    return NUM_BOARDS - 1;
+  }
+  if (k >= NUM_KEYS_PER_BOARD ) {
+    _println("Wrong LED id: keys per board %d, max %d", k, NUM_KEYS_PER_BOARD-1);
+    return NUM_KEYS_PER_BOARD - 1;
+  }
+  if (l >= NUM_LED_PER_KEY) {
+    _println("Wrong LED id: led per key %d, max %d", l, NUM_LED_PER_KEY-1);
+    return NUM_LED_PER_KEY - 1;
+  }
+  return b * (NUM_KEYS_PER_BOARD * NUM_LED_PER_KEY) + k + l * NUM_KEYS_PER_BOARD;
 }
 
 void updateLEDs() {
   Serial.println("Updating LEDs...");
   // Turn the LED on, then pause
-  int l = 0;
   for (int b = 0; b < NUM_BOARDS; b++) {
     for (int c = 0; c < NUM_KEYS_PER_BOARD; c++) {    
       //_println("UPD [%d] %d %d %d", l, _fields[b][c].Color.r, _fields[b][c].Color.g, _fields[b][c].Color.b);
-      _leds[l++] = _fields[b][c].Color;
+      for (int l = 0; l < NUM_LED_PER_KEY; l++) {
+        int ledId = ledIdFromBoardKey(b, c, l);
+        _leds[ledId] = _fields[b][c].Color;
+      }
     }
-    if (l >= NUM_KEYS) break;
   }
   FastLED.show();
   Serial.println("LEDs updated.");
@@ -203,7 +229,7 @@ void loopNormal() {
     mainDAC(_offset[key], 0); // set zeroPoint to center  
     delayMicroseconds(30);
 
-    int analogValue = analogRead(_adcPins[ADC_MAIN]);
+    int analogValue = analogRead(_adcPins[ADC_MAIN1]);
     float voltage = getAdcVoltage(analogValue); // (analogValue * VREF) / ADC_RESOLUTION; 
     peakDetect(voltage, key);
 
@@ -238,7 +264,7 @@ void midiHandleSystemEx(const byte *data, uint16_t length, bool last) {
     else if (command == 3 || command == 4)
         sysEx_noteOnOff(command, data, length);
     else if (command == 5) { 
-        for (int i=0; i < NUM_KEYS; i++)
+        for (int i=0; i < NUM_KEYS * NUM_LED_PER_KEY; i++) 
           _leds[i] = CRGB::Blue;
         FastLED.show();
         _loopState = STATE_CALIBRATION_START;
@@ -419,8 +445,11 @@ void sysEx_setField(const byte *data, uint16_t length) {
     _fields[board][boardKey].Color.green = mergeBytes(data[11], data[12]);
     _fields[board][boardKey].Color.blue = mergeBytes(data[7], data[8]);
 
-    _leds[board * NUM_KEYS_PER_BOARD + boardKey] = _fields[board][boardKey].Color;
-    FastLED.show();
+    for (int l = 0; l < NUM_LED_PER_KEY; l++) {
+      int ledId = ledIdFromBoardKey(board, boardKey, l);
+      _leds[ledId] = _fields[board][boardKey].Color;
+    }
+    //FastLED.show();
 }
 
 void sysEx_noteOnOff(int command, const byte *data, uint16_t length) {
@@ -438,8 +467,6 @@ void sysEx_noteOnOff(int command, const byte *data, uint16_t length) {
       return;
     }
 
-    int key = board * NUM_KEYS_PER_BOARD + boardKey;
-
     Serial.print("HIGHLIGHT [");
     Serial.print(board);
     
@@ -447,14 +474,15 @@ void sysEx_noteOnOff(int command, const byte *data, uint16_t length) {
     Serial.print(boardKey);
     Serial.print("] ");
     
-    //_fields[board][boardKey].Board = board;
-    //_fields[board][boardKey].BoardKey = boardKey;
     if (command == 3) {
       struct CRGB highlightColor;
       highlightColor.red = mergeBytes(data[7], data[8]);
       highlightColor.green = mergeBytes(data[9], data[10]);
       highlightColor.blue = mergeBytes(data[5], data[6]);
-      _leds[key] = highlightColor;
+      for (int l = 0; l < NUM_LED_PER_KEY; l++) {
+        int ledId = ledIdFromBoardKey(board, boardKey, l);
+        _leds[ledId] = highlightColor;
+      }
       FastLED.show();
     }
     if (command == 4) {
@@ -650,6 +678,15 @@ void getBoardAndBoardKey(int key, int &board, int &boardKey) {
 
     board = key / NUM_KEYS_PER_BOARD;
     boardKey = key % NUM_KEYS_PER_BOARD;
+
+    if (board >= NUM_BOARDS) {
+       _println("Wrong key id: board to high %d > %d", board, NUM_BOARDS - 1);
+      board = NUM_BOARDS - 1;
+    }
+    if (boardKey >= NUM_KEYS_PER_BOARD) {
+      _println("Wrong key id: board key to high %d > %d", boardKey, NUM_KEYS_PER_BOARD - 1);
+      boardKey = NUM_KEYS_PER_BOARD - 1;
+    }
 }
 
 // PEAK DETECT
@@ -726,8 +763,11 @@ void peakDetect(float voltage, int key) {
         }
         if (!playing[key]) {
           usbMIDI.sendNoteOn(_fields[board][boardKey].Note, velocity, _fields[board][boardKey].Channel);
-          playing[key] = true;            
-          _leds[key] = CRGB::White;
+          playing[key] = true;     
+          for(int l = 0; l < NUM_LED_PER_KEY; l++) {     
+            int ledId = ledIdFromBoardKey(board, boardKey, l);  
+            _leds[ledId] = CRGB::White;
+          }
           FastLED.show();
         } else {
           usbMIDI.sendPolyPressure(_fields[board][boardKey].Note, velocity, _fields[board][boardKey].Channel); // Send aftertouch data
@@ -744,8 +784,11 @@ void peakDetect(float voltage, int key) {
          state[key] = 1; 
       } else if (msec[key] > _aftershockMillis) {
         getBoardAndBoardKey(key, board, boardKey);
-        usbMIDI.sendNoteOff(_fields[board][boardKey].Note, 0, _fields[board][boardKey].Channel);            
-        _leds[key] = _fields[board][boardKey].Color;
+        usbMIDI.sendNoteOff(_fields[board][boardKey].Note, 0, _fields[board][boardKey].Channel);       
+        for (int l = 0; l < NUM_LED_PER_KEY; l++) {    
+          int ledId = ledIdFromBoardKey(board, boardKey, l); 
+          _leds[ledId] = _fields[board][boardKey].Color;
+        }
         FastLED.show();
         playing[key] = false;
         state[key] = 0; // go back to idle when
@@ -778,10 +821,7 @@ void setupADC() {
 // DAC
 void setupDAC() {
   pinMode(MAINDAC_CS_PIN, OUTPUT);
-  pinMode(OFFSETDAC_CS_PIN, OUTPUT);
-
   digitalWrite(MAINDAC_CS_PIN, HIGH);
-  digitalWrite(OFFSETDAC_CS_PIN, HIGH);
 
   Serial.println("Setup DACs...");
 
@@ -808,18 +848,6 @@ void mainDAC(uint16_t value, uint8_t channel)  //  channel = 0, 1
   SPI.transfer((uint8_t)(data & 0xFF));
   SPI.endTransaction();
   digitalWrite(MAINDAC_CS_PIN, HIGH);
-}
-
-void offsetDAC(uint16_t value, uint8_t channel)  //  channel = 0, 1
-{
-  uint16_t data = 0x3000 | value;
-  if (channel == 1) data |= 0x8000;
-  digitalWrite(OFFSETDAC_CS_PIN, LOW);
-  SPI1.beginTransaction(SPISettings(16000000, MSBFIRST, SPI_MODE0));
-  SPI1.transfer((uint8_t)(data >> 8));
-  SPI1.transfer((uint8_t)(data & 0xFF));
-  SPI1.endTransaction();
-  digitalWrite(OFFSETDAC_CS_PIN, HIGH);
 }
 
 
@@ -880,13 +908,13 @@ void loopCalibrationOff() {
   mainDAC(0, 0); // set zeroPoint to center
   delayMicroseconds(30);
 
-  int unscaledValue = analogRead(_adcPins[ADC_UNSCALED]);
+  int unscaledValue = analogRead(_adcPins[ADC_UNSCALED1]);
   float unscaledVoltage = getAdcVoltage(unscaledValue);
   int dacValue = getDacValue(unscaledVoltage);
   mainDAC(dacValue, 0); // set zeroPoint to center
   delayMicroseconds(300);
 
-  int scaledValue = analogRead(_adcPins[ADC_MAIN]);
+  int scaledValue = analogRead(_adcPins[ADC_MAIN1]);
   float scaledVoltage = getAdcVoltage(scaledValue);
 
   _println("[%d] Unscaled zero: %d %f V, scaled zero: %d %f V", _currentCalibrationKey, unscaledValue, unscaledVoltage, scaledValue, scaledVoltage);
@@ -894,19 +922,29 @@ void loopCalibrationOff() {
   _zeroVoltage[_currentCalibrationKey] = scaledVoltage;
   _offset[_currentCalibrationKey] = dacValue;
 
-  _leds[_currentCalibrationKey] = CRGB::Green;
+  int b, k;
+  getBoardAndBoardKey(_currentCalibrationKey, b, k);
+  for (int l = 0; l < NUM_LED_PER_KEY; l++) {
+    int ledId = ledIdFromBoardKey(b, k, l);
+    _leds[ledId] = CRGB::Green;
+  }
   FastLED.show();
 
   _loopState = STATE_CALIBRATION_WAIT_ON;
 }
 
 void loopCalibrationWaitOn() {
-  int currentValue = analogRead(_adcPins[ADC_MAIN]);
+  int currentValue = analogRead(_adcPins[ADC_MAIN1]);
   float currentVoltage = getAdcVoltage(currentValue); 
   float swing = fabs(currentVoltage - _zeroVoltage[_currentCalibrationKey]);
 
   if (swing > THRESHOLD_DELTA) {
-    _leds[_currentCalibrationKey] = CRGB::White;
+    int b, k;
+    getBoardAndBoardKey(_currentCalibrationKey, b, k);
+    for (int l = 0; l < NUM_LED_PER_KEY; l++) {
+      int ledId = ledIdFromBoardKey(b, k, l);
+      _leds[ledId] = CRGB::White;
+    }
     _maxSwing[_currentCalibrationKey] = swing;
     FastLED.show();
 
@@ -916,7 +954,7 @@ void loopCalibrationWaitOn() {
 }
 
 void loopCalibrationOn() {
-  int currentValue = analogRead(_adcPins[ADC_MAIN]);
+  int currentValue = analogRead(_adcPins[ADC_MAIN1]);
   float currentVoltage = getAdcVoltage(currentValue); 
   float swing = fabs(currentVoltage - _zeroVoltage[_currentCalibrationKey]);
 
@@ -934,7 +972,12 @@ void loopCalibrationOn() {
         percentageFull,
         _polarization[_currentCalibrationKey]);
 
-    _leds[_currentCalibrationKey] = CRGB::Black;
+    int b, k;
+    getBoardAndBoardKey(_currentCalibrationKey, b, k);
+    for (int l = 0; l < NUM_LED_PER_KEY; l++) {
+      int ledId = ledIdFromBoardKey(b, k, l);
+      _leds[ledId] = CRGB::Black;
+    }
     if (_currentCalibrationKey < NUM_KEYS_FOR_INPUT - 1) {
       _currentCalibrationKey++;
       _loopState = STATE_CALIBRATION_OFF;
@@ -1096,6 +1139,12 @@ bool loadCalibrationCSV() {
     return true;
 }
 
+// DPot
+
+void setupDPot() {
+  _dpot.setPercentage(0, 50);
+  _dpot.setPercentage(1, 50);
+}
 
 
 void _println(const char* format, ...) {
