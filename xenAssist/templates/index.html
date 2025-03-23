@@ -5,10 +5,28 @@
     <title>Freexen Assist</title>
     <!-- Load external CSS from /static/hex.css -->
     <link rel="stylesheet" href="{{ url_for('static', filename='hex.css') }}">
+	<link rel="preload" href="/static/fonts/Bravura.otf" as="font" type="font/otf" crossorigin>
+	<link rel="preload" href="/static/fonts/BravuraText.otf" as="font" type="font/otf" crossorigin>
 </head>
 <body>
     <!-- Toggle Button -->
     <button id="toggle-menu">Scale</button>
+	
+	<!-- Toggle Switch for pitch class view -->
+	<div id="pitchClass-switch-container" title="Toggle Note/Pitch class view">
+	  <label class="switch">
+		<input type="checkbox" id="pitchClassSwitch">
+		<span class="slider round"></span>
+	  </label>
+	</div>
+	
+	<!-- Toggle Switch for interval view -->
+	<div id="interval-switch-container" title="Toggle Absolute/Interval view">
+	  <label class="switch">
+		<input type="checkbox" id="intervalSwitch">
+		<span class="slider round"></span>
+	  </label>
+	</div>
 
     <!-- Overlay Menu -->
     <div id="menu-overlay">
