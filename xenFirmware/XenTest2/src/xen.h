@@ -1,12 +1,10 @@
+#include<Arduino.h>
+
 #ifndef XEN_H
 #define XEN_H
 
-#include <FastLED.h>
-
 #define NUM_BOARDS 5
 #define NUM_KEYS 280
-#define NUM_LED_PER_KEY 2
-#define NUM_KEYS_FOR_INPUT 112
 #define NUM_KEYS_PER_BOARD 56
 
 typedef struct {
@@ -14,8 +12,12 @@ typedef struct {
     byte BoardKey;
     byte Channel;
     byte Note;
-    CRGB Color;     // Pin number such as GPIO_PIN_3, GPIO_PIN_5, etc.
+    u_int8_t r;  
+    u_int8_t g;
+    u_int8_t b;  
 } XenField;
 
+void setKeyInterval(int from, int to);
+void getBoardAndBoardKey(int key, int &board, int &boardKey);
 
 #endif // XEN_H

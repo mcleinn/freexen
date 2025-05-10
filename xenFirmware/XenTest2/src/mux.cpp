@@ -3,7 +3,7 @@
 #include "mux.h"
 #include "xen.h"
 
-int _ms_delay_after_mux = 10;
+int _us_delay_after_mux = 10;
 
 void setupMux() { 
     for (int i = 0; i < NUM_SELECTLINES; i++) {
@@ -12,6 +12,7 @@ void setupMux() {
     for (int i = 0; i < NUM_SELECTLINES; i++) {
       pinMode(_selectPins[1][i], OUTPUT);
     }
+
     Serial.println("MUX initialized.");
     setMux(0, 0);
   }
@@ -23,13 +24,9 @@ void setupMux() {
     for (int i = 0; i < NUM_SELECTLINES; i++) {
       digitalWriteFast(_selectPins[1][i], (selectLine1 >> i) & 1);
     }
-  
-    //Serial.print("MUX=");
-    //Serial.print(selectLine0);
-    //Serial.print("-");
-    //Serial.print(selectLine1);
-    //Serial.println("");
-    delayMicroseconds(_ms_delay_after_mux);
+    
+   //_println("Child mux set to %d, top mux to %d", selectLine0, selectLine1);
+    delayMicroseconds(_us_delay_after_mux);
   }
   
   
@@ -92,25 +89,5 @@ void setupMux() {
   
       topMux = -1;
       topMuxOutput = -1;
-  }
-  
-  void getBoardAndBoardKey(int key, int &board, int &boardKey) {
-      if (key < 0) {
-          board = -1;
-          boardKey = -1;
-          return;
-      }
-  
-      board = key / NUM_KEYS_PER_BOARD;
-      boardKey = key % NUM_KEYS_PER_BOARD;
-  
-      if (board >= NUM_BOARDS) {
-         _println("Wrong key id: board to high %d > %d", board, NUM_BOARDS - 1);
-        board = NUM_BOARDS - 1;
-      }
-      if (boardKey >= NUM_KEYS_PER_BOARD) {
-        _println("Wrong key id: board key to high %d > %d", boardKey, NUM_KEYS_PER_BOARD - 1);
-        boardKey = NUM_KEYS_PER_BOARD - 1;
-      }
   }
   

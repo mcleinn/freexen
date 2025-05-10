@@ -2,8 +2,10 @@
 #include <SPI.h>
 #include "utils.h"
 #include "dac.h"
+#include "xen.h"
 
-int _ms_delay_after_dac = 30;
+int _us_delay_after_dac_zero = 30;
+int _us_delay_after_dac_set = 300;
 
 void setupDAC() {
     pinMode(MAINDAC_CS_PIN, OUTPUT);
@@ -32,7 +34,10 @@ void mainDAC(uint16_t value, uint8_t channel)  //  channel = 0, 1
     digitalWrite(MAINDAC_CS_PIN, HIGH);
 }
 
-
+void setDacMain(int key, uint16_t value) {  
+    int channel = key < (NUM_KEYS_PER_BOARD * BOARDS_PER_DAC_CHANNEL) ? 0 : 1;
+    mainDAC(value, channel); 
+}
 
 float getDacVoltage(int dacValue) {
     return (dacValue * DAC_VREF) / (float)DAC_RESOLUTION_MAX; 

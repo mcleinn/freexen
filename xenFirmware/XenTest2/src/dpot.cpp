@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include "utils.h"
 #include "dpot.h"
+#include "xen.h"
 
 void setupDPot() {
     pinMode(DPOT_CS_PIN, OUTPUT);
@@ -21,3 +22,7 @@ void dPot(byte address, byte value){
     digitalWrite(DPOT_CS_PIN, HIGH);
 }
   
+void setDPot(int key, byte value) {  
+    int channel = key < (NUM_KEYS_PER_BOARD * BOARDS_PER_DPOT_CHANNEL) ? 0 : 1;
+    dPot(channel, value); 
+}

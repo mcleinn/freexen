@@ -1,50 +1,85 @@
-#include<FastLED.h>
+#include <Adafruit_NeoPixel.h>
 #include "led.h"
 #include "xen.h"
 #include "utils.h"
 
-CRGB _leds[NUM_KEYS * NUM_LED_PER_KEY];
+Adafruit_NeoPixel *LEDStrip = nullptr;    
+int _numberLED = 0;
 
-void setupLEDs() {
-    FastLED.addLeds<WS2812B, DATA_PIN, GRB>(_leds, NUM_KEYS * NUM_LED_PER_KEY);  
+void setupLEDs(int numberLED) {
+    if (numberLED == 0) numberLED = NUM_KEYS;
+    if (numberLED >= NUM_KEYS) numberLED = NUM_KEYS;
+
+    delete LEDStrip;                        // free any previous buffer
+    LEDStrip = new Adafruit_NeoPixel(numberLED, DATA_PIN, NEO_GRB + NEO_KHZ800);
   
-    // Turn the LED on, then pause
-    for (int i=0; i < NUM_KEYS * NUM_LED_PER_KEY; i++)
-      _leds[i] = CRGB::Blue;
-    FastLED.show();
+    LEDStrip->begin();
+    LEDStrip->setBrightness(255);
+    
+    _numberLED = numberLED;
+  
+    for (int i=0; i < _numberLED; i++)
+      LEDStrip->setPixelColor(i, 0, 0, 255);
+    LEDStrip->show();
 }
 
+void updateLED(int ledId) {
+  if (_numberLED == 0) return;
+  int board, boardKey;
+  getBoardAndBoardKey(ledId, board, boardKey);
 
-void updateLEDs() {
-    Serial.println("Updating LEDs...");
-    // Turn the LED on, then pause
-    for (int b = 0; b < NUM_BOARDS; b++) {
-        for (int c = 0; c < NUM_KEYS_PER_BOARD; c++) {    
-        //_println("UPD [%d] %d %d %d", l, _fields[b][c].Color.r, _fields[b][c].Color.g, _fields[b][c].Color.b);
-        for (int l = 0; l < NUM_LED_PER_KEY; l++) {
-            int ledId = ledIdFromBoardKey(b, c, l);
-            _leds[ledId] = _fields[b][c].Color;
-        }
-        }
-    }
-    FastLED.show();
-    Serial.println("LEDs updated.");
+  LEDStrip->setPixelColor(ledId,  
+    LEDStrip->gamma8(_fields[board][boardKey].r), 
+    LEDStrip->gamma8(_fields[board][boardKey].g), 
+    LEDStrip->gamma8(_fields[board][boardKey].b));
+}
+
+void updateAllLEDs() {
+  updateLEDs(0, _numberLED-1);
+}
+
+void updateLEDs(int from, int to) {
+  if (_numberLED == 0) return;
+  Serial.println("Updating LEDs...");
+  // Turn the LED on, then pause
+  for (int ledId = from; ledId <= to; ledId++) {
+     if (ledId < 0 || ledId >= _numberLED) break;
+     updateLED(ledId);
+  }
+  Serial.println("LEDs updated.");
 }
 
 // board, key, led number -> unique ledId
-int ledIdFromBoardKey(short b, short k, short l) {
-    if (b >= NUM_BOARDS) {
-      _println("Wrong LED id: board %d, max %d", b, NUM_BOARDS-1);
-      return NUM_BOARDS - 1;
-    }
-    if (k >= NUM_KEYS_PER_BOARD ) {
-      _println("Wrong LED id: keys per board %d, max %d", k, NUM_KEYS_PER_BOARD-1);
-      return NUM_KEYS_PER_BOARD - 1;
-    }
-    if (l >= NUM_LED_PER_KEY) {
-      _println("Wrong LED id: led per key %d, max %d", l, NUM_LED_PER_KEY-1);
-      return NUM_LED_PER_KEY - 1;
-    }
-    return b * (NUM_KEYS_PER_BOARD * NUM_LED_PER_KEY) + k + l * NUM_KEYS_PER_BOARD;
+int ledIdFromBoardKey(short b, short k) {
+  if (b >= NUM_BOARDS) {
+    _println("Wrong LED id: board %d, max %d", b, NUM_BOARDS-1);
+    return NUM_BOARDS - 1;
   }
+  if (k >= NUM_KEYS_PER_BOARD ) {
+    _println("Wrong LED id: keys per board %d, max %d", k, NUM_KEYS_PER_BOARD-1);
+    return NUM_KEYS_PER_BOARD - 1;
+  }
+  return b * NUM_KEYS_PER_BOARD + k;
+}
+
+void setColor(int key, int r, int g, int b) {
+  if (_numberLED == 0) return;
   
+  int board, boardKey;
+  getBoardAndBoardKey(key, board, boardKey);
+  _fields[board][boardKey].r = r;
+  _fields[board][boardKey].g = g;
+  _fields[board][boardKey].b = b;
+}
+
+void setColorAll(int r, int g, int b) {
+  if (_numberLED == 0) return;
+
+  int board, boardKey;
+  for (int key=0; key < _numberLED; key++) {
+    getBoardAndBoardKey(key, board, boardKey);
+    _fields[board][boardKey].r = r;
+    _fields[board][boardKey].g = g;
+    _fields[board][boardKey].b = b;
+  }
+}

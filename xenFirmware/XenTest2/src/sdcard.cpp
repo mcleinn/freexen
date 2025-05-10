@@ -33,11 +33,11 @@ void setupCard() {
                 configFile.print(",");
                 configFile.print(field.Note);
                 configFile.print(",");
-                configFile.print(field.Color.r);
+                configFile.print(field.r);
                 configFile.print(",");
-                configFile.print(field.Color.g);
+                configFile.print(field.g);
                 configFile.print(",");
-                configFile.print(field.Color.b);
+                configFile.print(field.b);
                 configFile.println();
             }
         }
@@ -78,19 +78,19 @@ void loadConfigurationCSV() {
             lastPos = nextPos + 1;
 
             nextPos = line.indexOf(',', lastPos);
-            field.Color.r = (byte)line.substring(lastPos, nextPos).toInt();
+            field.r = (byte)line.substring(lastPos, nextPos).toInt();
             lastPos = nextPos + 1;
 
             nextPos = line.indexOf(',', lastPos);
-            field.Color.g = (byte)line.substring(lastPos, nextPos).toInt();
+            field.g = (byte)line.substring(lastPos, nextPos).toInt();
             lastPos = nextPos + 1;
 
             nextPos = line.indexOf(',', lastPos);
-            field.Color.b = (byte)line.substring(lastPos, nextPos).toInt();
+            field.b = (byte)line.substring(lastPos, nextPos).toInt();
             
             if (field.Board >= 0 && field.Board < NUM_BOARDS && field.Board >= 0 && field.BoardKey < NUM_KEYS_PER_BOARD) {
               _fields[field.Board][field.BoardKey] = field;
-              //_println("[%d] %d %d %d", field.Board * 56 + field.BoardKey, field.Color.r, field.Color.g, field.Color.b);
+              //_println("[%d] %d %d %d", field.Board * 56 + field.BoardKey, field.r, field.g, field.b);
             }
         }
         configFile.close();
