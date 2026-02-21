@@ -41,9 +41,6 @@ void midiHandleSystemEx(const byte *data, uint16_t length, bool last) {
   else if (command == 3 || command == 4)
       sysEx_noteOnOff(command, data, length);
   else if (command == 5) { 
-      for (int i=0; i < NUM_KEYS; i++) 
-      LEDStrip->setPixelColor(i, 0, 0, 255);
-      LEDStrip->show();
       _calibLoopState = STATE_CALIBRATION_START;
       _mainLoopState = 2;
       _manualCalibration = true;
@@ -81,7 +78,7 @@ void mts_receiveTuning(const byte *data, uint16_t length) {
   // Copy the tuning data from the incoming SysEx message (excluding metadata)
   memcpy(_currentTuning, data + 3, MTS_SYSEX_SIZE);
 
-  Serial.print("Tuning data received.");
+  _println("Tuning data received.");
   _tuningLoaded = true;
   mts_printTuningName();
 }
@@ -140,11 +137,11 @@ void mts_printTuningName() {
 }
 
 void mts_sendTuning() {
-if (!_tuningLoaded) return;
-Serial.println("Sending MTS SysEx message...");
-mts_printTuningName();
-usbMIDI.sendSysEx(MTS_SYSEX_SIZE, _currentTuning, true);
-Serial.println("Tuning sent!");
+  if (!_tuningLoaded) return;
+  Serial.println("Sending MTS SysEx message...");
+  mts_printTuningName();
+  usbMIDI.sendSysEx(MTS_SYSEX_SIZE, _currentTuning, true);
+  Serial.println("Tuning sent!");
 }
 
 bool mts_saveTuning() {  
@@ -177,12 +174,12 @@ bool mts_saveTuning() {
 }
 
 void sysEx_saveAndUpdate() {
-saveConfigurationCSV();
-updateAllLEDs();
+  saveConfigurationCSV();
+  updateAllLEDs();
 }
 
 void sysEx_update() {
-updateAllLEDs();
+  updateAllLEDs();
 }
 
 
@@ -204,12 +201,7 @@ void sysEx_setField(const byte *data, uint16_t length) {
   int channel = (byte)(data[5]);
   int note = (byte)(data[6]);
 
-  Serial.print("SET [");
-  Serial.print(board);
-  
-  Serial.print("-");
-  Serial.print(boardKey);
-  Serial.print("] ");
+  _println("SET [%d-%d] ", board, boardKey);
   
   _fields[board][boardKey].Board = board;
   _fields[board][boardKey].BoardKey = boardKey;
@@ -218,9 +210,6 @@ void sysEx_setField(const byte *data, uint16_t length) {
   _fields[board][boardKey].r = mergeBytes(data[9], data[10]);
   _fields[board][boardKey].g = mergeBytes(data[11], data[12]);
   _fields[board][boardKey].b = mergeBytes(data[7], data[8]);
-
-  int ledId = ledIdFromBoardKey(board, boardKey);
-  updateLED(ledId);
 }
 
 void sysEx_noteOnOff(int command, const byte *data, uint16_t length) {

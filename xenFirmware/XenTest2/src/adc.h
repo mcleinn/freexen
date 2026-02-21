@@ -20,4 +20,6 @@ float getAdcVoltage(int channel);
 int getAdcMain(int key);
 int getAdcUnscaled(int key);
 
+extern int _measureAvgStandard;
+
 #endif // ADC_H

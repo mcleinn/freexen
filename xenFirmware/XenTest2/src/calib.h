@@ -18,9 +18,9 @@ const int _aftershockMillis = 25; // aftershocks & vibration reject
 
 void setupCalibration();
 bool readKeyForCalibration();
-void readKeysNormal();
+void scanKeysNormal();
 void peakDetect(float voltage, int key);
-void readKeysNormal();
+void scanKeysNormal();
 void loopCalibrationStart();
 void loopCalibrationWaitOn();
 void loopCalibrationOn();
@@ -33,10 +33,15 @@ void peakDetect(float voltage, int key);
 void printCalibration(int key);
 void setOffset(int key, int offset);
 void setGain(int key, int offset);
-void setThreshold(float threshold);
+void setThreshold(int key, float threshold);
+void scanNoise(int ms);
+void hsvToRgb(float h, float s, float v, uint8_t &r, uint8_t &g, uint8_t &b);
+void showNoise(int adc);
+void printNoiseLevels();
 
 extern int _us_delay_after_dac_zero;
 extern int _us_delay_after_dac_set;
+extern int _us_delay_after_mux;
 extern int _fromKey, _toKey, _numberLED;
 extern Adafruit_NeoPixel* LEDStrip;
 

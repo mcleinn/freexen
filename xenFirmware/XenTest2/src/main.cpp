@@ -29,11 +29,15 @@ Command commandTable[] = {
   {"m", handleMux, "Set mux"},
   {"kc", handleKeyWithColor, "Set key index (no arg for all, otherwise key or from,to)"},
   {"o", handleDAC, "Set DAC value (0 to 4095), optional 2nd param = channel"},
+  {"a", handleAveraging, "Set averaging value to 1,2,4,8,16,32"},
   {"g", handleDPot, "Set digital potentiometer value (0 to 255), optional 2nd param = channel"},
   {"t", handleThreshold, "Set threshold"},
   {"c", handleSetColorSelected, "Set color for selected keys (three parameters 0-255)"},
   {"ca", handleSetColorAll, "Set color for all keys (three parameters 0-255)"},
   {"x", handleCalibrate, "Enter calibration mode"},
+  {"r", handleRun, "Enter run mode"},
+  {"p", handlePlot, "Enter plot mode"},
+  {"n", handleMeasureNoise, "Measure noise for selected keys (duration in s, adc 0 or adc 1)"},
   {"lconf", handleLoadConfig, "Load configuration (optional: program ID)"},
   {"sconf", handleSaveConfig, "Save configuration (optional: program ID)"},
   {"lcalib", handleLoadCalib, "Load calibration"},
@@ -50,17 +54,15 @@ void setup() {
 
   unsigned long timeout = millis();
 
-  // Wait a short time for serial monitor to connect (or timeout)
-  while (!Serial && millis() - timeout < 2000);
-
-  if (Serial) {
+  bool connected = Serial && Serial.dtr();  
+  if (connected) {
     _debugMode = true;
     Serial.println("Debug mode enabled.");
     _mainLoopState = 0;
     _program = 9;
   } else {
     _mainLoopState = 3;
-    _program = 5;
+    _program = 0;
   }
 
   handleHelp(nullptr, 0); 
@@ -77,7 +79,8 @@ void setup() {
   loadConfigurationCSV();
   updateAllLEDs();
 
-  loadCalibrationCSV();
+  if (!connected)
+    loadCalibrationCSV();
 
   Serial.println("Ready to receive commands (e.g. a123)...");
 }
@@ -115,10 +118,33 @@ void loop() {
     }
   } else if (_mainLoopState == 3) {
     // Normal operation mode
-    readKeysNormal();
-  }
+    scanKeysNormal();
+  } else if (_mainLoopState == 4) {
+    // Noise 0 operation mode
+    scanNoise(500);
+    showNoise(0);
+  } else if (_mainLoopState == 5) {
+    // Noise 1 operation mode
+    scanNoise(500);
+    showNoise(1);
+  } 
 
   LEDStrip->show();
+  updateDebugState();
+}
+
+void updateDebugState()
+{
+    bool connected = Serial && Serial.dtr();  
+
+    if (connected && !_debugMode) {            
+      _debugMode      = true;
+        Serial.println("Debug mode enabled.");
+    }
+    else if (!connected && _debugMode) {        
+      _debugMode      = false;
+        // no Serial.print() here – there’s nowhere to send it
+    }
 }
 
 void checkSerial() {
@@ -207,13 +233,33 @@ void handleLoop(float* params, int count) {
 void handleCalibrate(float* params, int count) {
   if (_mainLoopState == 2) {
     _calibLoopState = STATE_CALIBRATION_STOP;
-    Serial.print("Cancelling calibration.");
+    _println("Cancelling calibration.");
     return;
   }
   _mainLoopState = 2;
   _manualCalibration = true;
   _calibLoopState = STATE_CALIBRATION_START;
-  Serial.print("Entered calibration loop.");
+  _println("Entered calibration loop.");
+}
+
+void handleRun(float* params, int count) {
+  if (_mainLoopState == 3) {
+    _mainLoopState = 0;
+    _println("Cancelling run.");
+    return;
+  }
+  _mainLoopState = 3;
+  _println("Entered run loop.");
+}
+
+void handlePlot(float* params, int count) {
+  if (_mainLoopState == 1) {
+    _mainLoopState = 0;
+    _println("Cancelling plot.");
+    return;
+  }
+  _mainLoopState = 1;
+  _println("Entered plot loop.");
 }
 
 void handleKey(float* params, int count) {
@@ -263,8 +309,9 @@ void handleDPot(float* params, int count) {
 
 void handleThreshold(float* params, int count) {
   if (count >= 1) {
-    setThreshold(params[0]);
-    _println("Threshold now %f V", params[0]);
+    for (int k=_fromKey; k <= _toKey; k++) 
+      setThreshold(k, params[0]);
+    _println("Threshold for %d to %d now %f V", _fromKey+1, _toKey+1, params[0]);
   }
 }
 
@@ -303,7 +350,6 @@ void handleSetupLEDs(float* params, int count) {
   }  
 }
 
-
 void handleSetColorSelected(float* params, int count) {
   _println("%d parameters.", count);
   if (count == 0) {
@@ -337,6 +383,29 @@ void handleMux(float* params, int count) {
   if (count == 2) {
     setMux((int)params[0], (int)params[1]);
   }
+}
+
+void handleAveraging(float* params, int count) {
+  if (count == 1) {
+    _measureAvgStandard = (int)params[0];
+    analogReadAveraging(_measureAvgStandard);
+    _println("ADC set to averaging %d.", _measureAvgStandard);
+  }
+}
+
+void handleMeasureNoise(float* params, int count) {
+  _mainLoopState = 0;
+  if (count == 0) 
+    scanNoise(1000);
+  else if (count >= 1)
+    scanNoise((int)(params[0]*1000));
+
+  if (count < 2)
+    showNoise(0);
+  else 
+    showNoise((int)params[1]);
+
+  printNoiseLevels();
 }
 
 void handleHelp(float* params, int count) {

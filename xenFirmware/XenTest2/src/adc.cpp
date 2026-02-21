@@ -4,10 +4,11 @@
 #include "adc.h"
 
 void setupADC() {
-    analogReadResolution(12);  // Set ADC resolution to 12 bits (0-4095)
+    analogReadResolution(ADC_RESOLUTION);  // Set ADC resolution to 12 bits (0-4095)
+    analogReadAveraging(_measureAvgStandard);
     for (int adc=0; adc<NUM_ADCS; adc++)
         pinMode(_adcPins[adc], INPUT_DISABLE);
-    Serial.println("ADC intialized.");
+    _println("ADC intialized, averaging %d.", _measureAvgStandard);
 }
 
 int getAdcMain(int key) {

@@ -21,7 +21,6 @@ void setupDAC() {
     Serial.println("DACs intialized.");
 }
 
-
 void mainDAC(uint16_t value, uint8_t channel)  //  channel = 0, 1
 {
     uint16_t data = 0x3000 | value;

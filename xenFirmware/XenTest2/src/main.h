@@ -19,6 +19,9 @@ void handleLoop(float* params, int count);
 void handleKey(float* params, int count);
 void handleChannel(float* params, int count);
 void handleCalibrate(float* params, int count);
+void handleAveraging(float* params, int count);
+void handleRun(float* params, int count);
+void handlePlot(float* params, int count);
 void handleDAC(float* params, int count);
 void handleDPot(float* params, int count);
 void handleHelp(float* params, int count);
@@ -33,9 +36,10 @@ void handleSetupLEDs(float* params, int count);
 void handleUpdateLEDs(float* params, int count);
 void handleSetupCalib(float* params, int count);
 void handleThreshold(float* params, int count);
+void handleMeasureNoise(float* params, int count);
 void handleMux(float* params, int count);
 void checkSerial();
-
-extern int _currentCalibrationKey;
+void updateDebugState();
+extern int _currentCalibrationKey, _measureAvgStandard;
 
 #endif // MAIN_H
