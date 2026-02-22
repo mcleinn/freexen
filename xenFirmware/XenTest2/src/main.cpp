@@ -17,12 +17,15 @@
 
 // Forward decls for commands referenced by commandTable.
 void handleDumpCalib(float* params, int count);
+void handleDumpCalibMeta(float* params, int count);
+void handleCalIssues(float* params, int count);
 
 int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 49;
+static const int XEN_FW_VERSION = 53;
+// (bump)
 
 static inline void mcpAck()
 {
@@ -112,6 +115,8 @@ Command commandTable[] = {
   {"ver", handleVersion, "Print firmware version"},
   {"calstat", handleCalStat, "Calibration status (all keys)"},
   {"dcalib", handleDumpCalib, "Dump calib.csv as JSONL"},
+  {"dmeta", handleDumpCalibMeta, "Dump calib_meta.csv as JSONL"},
+  {"calissues", handleCalIssues, "Print last calibration issues (RAM)"},
   {"lconf", handleLoadConfig, "Load configuration (optional: program ID)"},
   {"sconf", handleSaveConfig, "Save configuration (optional: program ID)"},
   {"lcalib", handleLoadCalib, "Load calibration"},
@@ -212,7 +217,11 @@ void loop() {
     showNoise(0);
   }
 
-  LEDStrip->show();
+  // In calibration mode, LEDs are driven explicitly by calibration steps.
+  // Avoid re-showing stale pixels which can look like flicker on unrelated keys.
+  if (_mainLoopState != 2) {
+    LEDStrip->show();
+  }
   updateDebugState();
 }
 
@@ -657,6 +666,116 @@ void handleDumpCalib(float* params, int count)
   }
 
   Serial.println("{\"type\":\"dcalib_done\",\"ok\":1}");
+}
+
+void handleCalIssues(float* params, int count)
+{
+  (void)params;
+  (void)count;
+  mcpAck();
+  printLastCalibrationIssues();
+}
+
+void handleDumpCalibMeta(float* params, int count)
+{
+  (void)params;
+  (void)count;
+  mcpAck();
+
+  File f = SD.open("calib_meta.csv", FILE_READ);
+  if (!f) {
+    if (_outputFormat) {
+      Serial.println("{\"type\":\"dmeta\",\"ok\":0,\"error\":\"open_failed\"}");
+    } else {
+      _println("dmeta error: failed to open calib_meta.csv");
+    }
+    return;
+  }
+
+  if (_outputFormat) {
+    Serial.println("{\"type\":\"dmeta_start\",\"file\":\"calib_meta.csv\"}");
+  }
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (line.startsWith("#")) continue;
+
+    int lastPos = 0;
+    int nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int key = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int board = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int boardKey = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int skipped = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int notTrig = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int selfTrig = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int notRel = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    nextPos = line.indexOf(',', lastPos);
+    if (nextPos < 0) continue;
+    const int slightly = line.substring(lastPos, nextPos).toInt();
+    lastPos = nextPos + 1;
+
+    const unsigned long releaseMs = (unsigned long)line.substring(lastPos).toInt();
+
+    if (_outputFormat) {
+      Serial.print("{\"type\":\"dmeta_row\",\"key\":");
+      Serial.print(key);
+      Serial.print(",\"board\":");
+      Serial.print(board);
+      Serial.print(",\"boardKey\":");
+      Serial.print(boardKey);
+      Serial.print(",\"skipped\":");
+      Serial.print(skipped);
+      Serial.print(",\"notTriggering\":");
+      Serial.print(notTrig);
+      Serial.print(",\"selfTriggering\":");
+      Serial.print(selfTrig);
+      Serial.print(",\"notReleasing\":");
+      Serial.print(notRel);
+      Serial.print(",\"slightlyStuck\":");
+      Serial.print(slightly);
+      Serial.print(",\"releaseMs\":");
+      Serial.print(releaseMs);
+      Serial.println("}");
+    } else {
+      _println("meta key=%d board=%d boardKey=%d skip=%d notTrig=%d selfTrig=%d notRel=%d slightly=%d releaseMs=%lu",
+              key + 1, board + 1, boardKey + 1,
+              skipped, notTrig, selfTrig, notRel, slightly, releaseMs);
+    }
+  }
+
+  f.close();
+  if (_outputFormat) {
+    Serial.println("{\"type\":\"dmeta_done\",\"ok\":1}");
+  }
 }
 
 void handleClearCalib(float* params, int count)

@@ -30,6 +30,10 @@ static uint32_t _calibWaitOnStartMs = 0;
 static bool _calibSelfTriggering[NUM_KEYS];
 static bool _calibNotReleasing[NUM_KEYS];
 static bool _calibSlightlyStuck[NUM_KEYS];
+static uint32_t _calibReleaseMs[NUM_KEYS];
+
+// Tracks if the current issue arrays contain a completed run summary.
+static bool _calibRunHasSummary = false;
 
 // Per-key state timers (avoid static carry-over between keys)
 static uint32_t _calibHoldStartMs = 0;
@@ -304,10 +308,11 @@ void clearCalibration(int fromKey, int toKey)
 void loopCalibrationStart() {
     bool ok = !_manualCalibration && loadCalibrationCSV();
     
-    if (ok) { 
-      for (int k=0; k<_numberLED; k++)
-        LEDStrip->setPixelColor(k, 0, 0, k >= _fromKey && k <= _toKey ? 255 : 0);
-  
+    if (ok) {
+      // Calibration already loaded; keep non-selected keys off and do not
+      // paint a range highlight during calibration.
+      setColorAll(0, 0, 0);
+      updateAllLEDs();
       _calibLoopState = STATE_RUNNING;
       return;
     }
@@ -320,7 +325,10 @@ void loopCalibrationStart() {
       _calibSelfTriggering[k] = false;
       _calibNotReleasing[k] = false;
       _calibSlightlyStuck[k] = false;
+      _calibReleaseMs[k] = 0;
     }
+
+    _calibRunHasSummary = false;
 
     _calibHoldStartMs = 0;
     _calibOnStartMs = 0;
@@ -634,7 +642,7 @@ void loopCalibrationOn() {
     // Not releasing detection: if user never returns under threshold within a limit, mark and advance.
     // Also track "slightly stuck" if release takes >2s (still succeeds).
     if (_calibOnStartMs == 0) _calibOnStartMs = millis();
-    const uint32_t slightlyStuckMs = 2000;
+    const uint32_t slightlyStuckMs = 1000;
     const uint32_t notReleasingMs = 6000;
     if (millis() - _calibOnStartMs > notReleasingMs) {
         _calibNotReleasing[_currentCalibrationKey] = true;
@@ -680,6 +688,7 @@ void loopCalibrationOn() {
         if (releaseMs > slightlyStuckMs) {
           _calibSlightlyStuck[_currentCalibrationKey] = true;
         }
+        _calibReleaseMs[_currentCalibrationKey] = releaseMs;
 
         // Successful calibration for this key.
         _hasZero[_currentCalibrationKey] = true;
@@ -742,6 +751,41 @@ void loopCalibrationStop() {
     _calibDirty = false;
     updateAllLEDs();
 
+    // Persist last-run issues to SD for post-processing.
+    {
+      const char* metaFile = "calib_meta.csv";
+      SD.remove(metaFile);
+      File f = SD.open(metaFile, FILE_WRITE);
+      if (f) {
+        f.println("#calib_meta_v1");
+        f.println("#key,board,boardKey,skipped,notTriggering,selfTriggering,notReleasing,slightlyStuck,releaseMs");
+        for (int k = _fromKey; k <= _toKey; ++k) {
+          int board, boardKey;
+          getBoardAndBoardKey(k, board, boardKey);
+          f.print(k);
+          f.print(',');
+          f.print(board);
+          f.print(',');
+          f.print(boardKey);
+          f.print(',');
+          f.print(_calibSkipped[k] ? 1 : 0);
+          f.print(',');
+          f.print(_calibFailed[k] ? 1 : 0);
+          f.print(',');
+          f.print(_calibSelfTriggering[k] ? 1 : 0);
+          f.print(',');
+          f.print(_calibNotReleasing[k] ? 1 : 0);
+          f.print(',');
+          f.print(_calibSlightlyStuck[k] ? 1 : 0);
+          f.print(',');
+          f.println((unsigned long)_calibReleaseMs[k]);
+        }
+        f.close();
+      }
+    }
+
+    _calibRunHasSummary = true;
+
     if (_outputFormat) {
       Serial.println("{\"type\":\"calib_saved\",\"file\":\"calib.csv\",\"ok\":1}");
 
@@ -750,11 +794,13 @@ void loopCalibrationStop() {
       int notTriggering = 0;
       int selfTriggering = 0;
       int notReleasing = 0;
+      int slightlyStuck = 0;
       for (int k = _fromKey; k <= _toKey; ++k) {
         if (_calibSkipped[k]) skipped++;
         if (_calibFailed[k]) notTriggering++;
         if (_calibSelfTriggering[k]) selfTriggering++;
         if (_calibNotReleasing[k]) notReleasing++;
+        if (_calibSlightlyStuck[k]) slightlyStuck++;
       }
       Serial.print("{\"type\":\"calib_done\",\"Skipped\":");
       Serial.print(skipped);
@@ -764,10 +810,12 @@ void loopCalibrationStop() {
       Serial.print(selfTriggering);
       Serial.print(",\"NotReleasing\":");
       Serial.print(notReleasing);
+      Serial.print(",\"SlightlyStuck\":");
+      Serial.print(slightlyStuck);
       Serial.println("}");
 
       for (int k = _fromKey; k <= _toKey; ++k) {
-        if (!_calibSkipped[k] && !_calibFailed[k] && !_calibSelfTriggering[k] && !_calibNotReleasing[k]) continue;
+        if (!_calibSkipped[k] && !_calibFailed[k] && !_calibSelfTriggering[k] && !_calibNotReleasing[k] && !_calibSlightlyStuck[k]) continue;
         int board, boardKey;
         getBoardAndBoardKey(k, board, boardKey);
         Serial.print("{\"type\":\"calib_issue\",\"key\":");
@@ -780,7 +828,15 @@ void loopCalibrationStop() {
         if (_calibSelfTriggering[k]) Serial.print("SelfTriggering");
         else if (_calibNotReleasing[k]) Serial.print("NotReleasing");
         else if (_calibFailed[k]) Serial.print("NotTriggering");
-        else Serial.print("Skipped");
+        else if (_calibSkipped[k]) Serial.print("Skipped");
+        else Serial.print("SlightlyStuck");
+        if (_calibSlightlyStuck[k]) {
+          Serial.print("\",\"releaseMs\":");
+          Serial.print(_calibReleaseMs[k]);
+          Serial.print(",\"slightlyStuck\":1");
+          Serial.println("}");
+          continue;
+        }
         Serial.println("\"}");
       }
     } else {
@@ -806,6 +862,79 @@ void loopCalibrationStop() {
   
     _calibLoopState = STATE_RUNNING;
   }
+
+void printLastCalibrationIssues()
+{
+  // Prints the last calibration run issues for the currently selected range.
+  if (!_calibRunHasSummary) {
+    if (_outputFormat) {
+      Serial.println("{\"type\":\"calissues\",\"ok\":0,\"error\":\"no_summary\"}");
+    } else {
+      _println("calissues: no completed calibration summary yet");
+    }
+    return;
+  }
+
+  int skipped = 0;
+  int notTriggering = 0;
+  int selfTriggering = 0;
+  int notReleasing = 0;
+  int slightlyStuck = 0;
+  for (int k = _fromKey; k <= _toKey; ++k) {
+    if (_calibSkipped[k]) skipped++;
+    if (_calibFailed[k]) notTriggering++;
+    if (_calibSelfTriggering[k]) selfTriggering++;
+    if (_calibNotReleasing[k]) notReleasing++;
+    if (_calibSlightlyStuck[k]) slightlyStuck++;
+  }
+
+  if (_outputFormat) {
+    Serial.print("{\"type\":\"calissues\",\"ok\":1,\"from\":");
+    Serial.print(_fromKey);
+    Serial.print(",\"to\":");
+    Serial.print(_toKey);
+    Serial.print(",\"Skipped\":");
+    Serial.print(skipped);
+    Serial.print(",\"NotTriggering\":");
+    Serial.print(notTriggering);
+    Serial.print(",\"SelfTriggering\":");
+    Serial.print(selfTriggering);
+    Serial.print(",\"NotReleasing\":");
+    Serial.print(notReleasing);
+    Serial.print(",\"SlightlyStuck\":");
+    Serial.print(slightlyStuck);
+    Serial.println("}");
+
+    for (int k = _fromKey; k <= _toKey; ++k) {
+      if (!_calibSkipped[k] && !_calibFailed[k] && !_calibSelfTriggering[k] && !_calibNotReleasing[k] && !_calibSlightlyStuck[k]) continue;
+      int board, boardKey;
+      getBoardAndBoardKey(k, board, boardKey);
+      Serial.print("{\"type\":\"calissue_row\",\"key\":");
+      Serial.print(k);
+      Serial.print(",\"board\":");
+      Serial.print(board);
+      Serial.print(",\"boardKey\":");
+      Serial.print(boardKey);
+      Serial.print(",\"skipped\":");
+      Serial.print(_calibSkipped[k] ? 1 : 0);
+      Serial.print(",\"notTriggering\":");
+      Serial.print(_calibFailed[k] ? 1 : 0);
+      Serial.print(",\"selfTriggering\":");
+      Serial.print(_calibSelfTriggering[k] ? 1 : 0);
+      Serial.print(",\"notReleasing\":");
+      Serial.print(_calibNotReleasing[k] ? 1 : 0);
+      Serial.print(",\"slightlyStuck\":");
+      Serial.print(_calibSlightlyStuck[k] ? 1 : 0);
+      Serial.print(",\"releaseMs\":");
+      Serial.print((unsigned long)_calibReleaseMs[k]);
+      Serial.println("}");
+    }
+  } else {
+    _println("calissues from=%d to=%d Skipped=%d NotTriggering=%d SelfTriggering=%d NotReleasing=%d SlightlyStuck=%d",
+             _fromKey + 1, _toKey + 1,
+             skipped, notTriggering, selfTriggering, notReleasing, slightlyStuck);
+  }
+}
   
   
 void saveCalibrationCSV() {

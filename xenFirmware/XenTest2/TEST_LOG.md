@@ -184,3 +184,62 @@ Key findings
 - Persistence/coverage after run:
   - `calstat`: hasZero=56, hasThr=56, nSigma=56
   - observed sigma range on board 1: minSigma~0.001365, maxSigma~0.001911
+
+## 2026-02-22 16:23:06
+
+### fw=53
+
+Calibrate board 3 (k113,168) with stuck-issue persistence
+
+Run (COM3)
+- `fmt1`
+- `k113,168`
+- `x` (guided calibration for board 3)
+
+Results
+- Overall after run: `calstat hasZero=167 hasThr=168 nSigma=168` (boards 1-3 attempted)
+- After `scalib` + `lcalib`: `calstat hasZero=167 hasThr=167 nSigma=167`
+- Board 3 coverage: `dcalib` shows 55/56 keys calibrated (1 key failed)
+
+Issues (board 3)
+- `calissues` for `k113,168`: `NotReleasing=1` (others 0)
+- Failing key: global key 120 (1-based), board 3 key 8 (1-based)
+  - JSON: `{"type":"calissue_row","key":119,"board":2,"boardKey":7,"notReleasing":1}`
+- SD persistence: `dmeta` confirms the same key has `notReleasing=1`
+
+Quality snapshot (board 3, calibrated keys)
+- Weakest maxSwing: key 114 (boardKey 2) ~0.030155 V (near 30 mV clamp)
+- Noisiest sigma: max ~0.001737 V (key 148 / boardKey 36)
+
+## 2026-02-22 16:32:29
+
+### fw=53
+
+Calibrate boards 4 (k169,224) and 5 (k225,280)
+
+Board 4 run (COM3)
+- `fmt1`
+- `k169,224`
+- `x`
+
+Board 4 results
+- `calissues` for `k169,224`: Skipped=0, NotTriggering=0, SelfTriggering=0, NotReleasing=0, SlightlyStuck=0
+- `dcalib` (board 4): 56/56 calibrated
+- Polarity skew (board 4): pol+1=7, pol-1=49
+- Sigma (board 4): min~0.001272, max~0.002519 (key 199 / boardKey 31 is the main outlier)
+- Weakest maxSwing (board 4): key 170 (boardKey 2) ~0.030718 V (near 30 mV clamp)
+
+Board 5 run (COM3)
+- `fmt1`
+- `k225,280`
+- `x`
+
+Board 5 results
+- `calissues` for `k225,280`: Skipped=0, NotTriggering=0, SelfTriggering=0, NotReleasing=0, SlightlyStuck=0
+- `dcalib` (board 5): 56/56 calibrated
+- Sigma (board 5): min~0.001212, max~0.001753
+- Weakest maxSwing (board 5): key 279 (boardKey 55) ~0.032776 V; key 277 (boardKey 53) ~0.033400 V
+
+Overall after board 5
+- `calstat`: hasZero=279, hasThr=279, nSigma=279 (one key still uncalibrated from board 3 NotReleasing)
+- After `scalib` + `lcalib`: `calstat` unchanged
