@@ -19,13 +19,14 @@
 void handleDumpCalib(float* params, int count);
 void handleDumpCalibMeta(float* params, int count);
 void handleCalIssues(float* params, int count);
+void handleAutoTuneIdle(float* params, int count);
+void handleAutoTuneDump(float* params, int count);
 
 int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 53;
-// (bump)
+static const int XEN_FW_VERSION = 66;
 
 static inline void mcpAck()
 {
@@ -74,6 +75,227 @@ static void endJson() {
   Serial.println("}");
 }
 
+static void setAveragingRamOnly(int avg)
+{
+  _measureAvgStandard = avg;
+  analogReadAveraging(avg);
+}
+
+static void setMuxDelayRamOnly(int us)
+{
+  if (us < 0) us = 0;
+  if (us > 500) us = 500;
+  _us_delay_after_mux = us;
+}
+
+// --- Autotune run capture (RAM only; keep one run) ---
+static bool _autoHasRun = false;
+static bool _autoRunComplete = false;
+static uint32_t _autoRunId = 0;
+static uint32_t _autoRunStartMs = 0;
+static int _autoFromKey = 0;
+static int _autoToKey = 0;
+static int _autoOrigAvg = 0;
+static int _autoOrigSd = 0;
+static int _autoBestAvg = 0;
+static int _autoBestSd = 0;
+static int _autoTuneSeconds = 0;
+static int _autoValidateSeconds = 0;
+static int _autoBestTuneTotal = 0;
+static int _autoBestValidateTotal = 0;
+static int _autoTrialsRun = 0;
+static int _autoMaxThrKey = -1;
+static float _autoMaxThr = 0.0f;
+
+// Metrics captured at end of autotune (RAM-only)
+static float _autoKeysPerSec = 0.0f;
+static float _autoRevisitMsEst = 0.0f;
+static float _autoOverMin = 0.0f;
+static float _autoOverMax = 0.0f;
+static int _autoOverMinKey = -1;
+static int _autoOverMaxKey = -1;
+
+// Capture per-key info from the best candidate.
+static uint16_t _autoCountsBest[NUM_KEYS];
+static float _autoMaxExcursion[NUM_KEYS];
+static float _autoThrBefore[NUM_KEYS];
+static float _autoThrAfter[NUM_KEYS];
+
+// Spike diagnostics for strict offenders (top N)
+static const int AUTO_SPIKE_MAX = 12;
+static int _autoSpikeN = 0;
+static int _autoSpikeKey[AUTO_SPIKE_MAX];
+static uint16_t _autoSpikeCountStrict[AUTO_SPIKE_MAX];
+static float _autoSpikeMaxExcStrict[AUTO_SPIKE_MAX];
+static float _autoSpikeThrAtStrict[AUTO_SPIKE_MAX];
+static uint16_t _autoSpikeCount1[AUTO_SPIKE_MAX];
+static uint16_t _autoSpikeCount2[AUTO_SPIKE_MAX];
+static float _autoSpikeMaxExc1[AUTO_SPIKE_MAX];
+static float _autoSpikeMaxExc2[AUTO_SPIKE_MAX];
+static int _autoSpikeCarryoverLikely[AUTO_SPIKE_MAX];
+
+// Capture trial summary (small, non-spam).
+struct AutoTrial {
+  int avg;
+  int sd;
+  int seconds;
+  int total;
+  int adjustedKeys;
+  float maxThr;
+};
+
+static const int AUTO_MAX_TRIALS = 32;
+static AutoTrial _autoTrials[AUTO_MAX_TRIALS];
+static int _autoTrialsN = 0;
+
+static int idleAuditCountsAndMax(int seconds, uint16_t* outCounts, float* outMaxExc)
+{
+  const uint32_t ms = (uint32_t)max(1, seconds) * 1000UL;
+  memset(outCounts, 0, sizeof(uint16_t) * NUM_KEYS);
+  for (int k = 0; k < NUM_KEYS; ++k) outMaxExc[k] = 0.0f;
+
+  const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD;
+  const uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    for (int muxPos = 0; muxPos < OFFSET; ++muxPos) {
+      const int keyA = muxPos;
+      const int keyB = muxPos + OFFSET;
+
+      const bool doA = (keyA >= _fromKey) && (keyA <= _toKey) && _hasZero[keyA];
+      const bool doB = (keyB >= _fromKey) && (keyB <= _toKey) && _hasZero[keyB];
+      if (!doA && !doB) continue;
+
+      setKey(muxPos);
+
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+
+      if (doA) {
+        const float v = getAdcVoltage(getAdcUnscaled(keyA));
+        const float swing = fabsf(v - _zeroVoltage[keyA]);
+        if (swing > outMaxExc[keyA]) outMaxExc[keyA] = swing;
+        if (swing > _threshold_delta[keyA] && outCounts[keyA] != 0xFFFF) outCounts[keyA]++;
+      }
+      if (doB) {
+        const float v = getAdcVoltage(getAdcUnscaled(keyB));
+        const float swing = fabsf(v - _zeroVoltage[keyB]);
+        if (swing > outMaxExc[keyB]) outMaxExc[keyB] = swing;
+        if (swing > _threshold_delta[keyB] && outCounts[keyB] != 0xFFFF) outCounts[keyB]++;
+      }
+    }
+  }
+
+  int total = 0;
+  for (int k = _fromKey; k <= _toKey; ++k) total += outCounts[k];
+  return total;
+}
+
+static void computeDynamicsMetrics(float &outOverMin, float &outOverMax, int &outOverMinKey, int &outOverMaxKey)
+{
+  outOverMin = 1e9f;
+  outOverMax = -1e9f;
+  outOverMinKey = -1;
+  outOverMaxKey = -1;
+  for (int k = _fromKey; k <= _toKey; ++k) {
+    if (!_hasZero[k]) continue;
+    const float over = _maxSwing[k] - _threshold_delta[k];
+    if (over < outOverMin) { outOverMin = over; outOverMinKey = k; }
+    if (over > outOverMax) { outOverMax = over; outOverMaxKey = k; }
+  }
+  if (outOverMinKey < 0) { outOverMin = 0.0f; outOverMax = 0.0f; }
+}
+
+static void spikeDiagStrictOffenders(int seconds)
+{
+  _autoSpikeN = 0;
+
+  // Build top offender list from last strict counts stored in _autoCountsBest.
+  for (int k = _autoFromKey; k <= _autoToKey; ++k) {
+    if (!_hasZero[k]) continue;
+    const uint16_t c = _autoCountsBest[k];
+    if (c == 0) continue;
+    // Insert into top list
+    int ins = -1;
+    for (int i = 0; i < _autoSpikeN; ++i) {
+      if (c > _autoSpikeCountStrict[i]) { ins = i; break; }
+    }
+    if (ins < 0) {
+      if (_autoSpikeN < AUTO_SPIKE_MAX) ins = _autoSpikeN;
+      else continue;
+    }
+    if (_autoSpikeN < AUTO_SPIKE_MAX) {
+      if (ins < _autoSpikeN) {
+        for (int j = min(_autoSpikeN, AUTO_SPIKE_MAX - 1); j > ins; --j) {
+          _autoSpikeKey[j] = _autoSpikeKey[j-1];
+          _autoSpikeCountStrict[j] = _autoSpikeCountStrict[j-1];
+        }
+      }
+      if (_autoSpikeN < AUTO_SPIKE_MAX) _autoSpikeN = min(_autoSpikeN + 1, AUTO_SPIKE_MAX);
+      _autoSpikeKey[ins] = k;
+      _autoSpikeCountStrict[ins] = c;
+    }
+  }
+
+  // Copy strict pass max excursion/threshold for these keys (if available).
+  for (int i = 0; i < _autoSpikeN; ++i) {
+    const int key = _autoSpikeKey[i];
+    _autoSpikeThrAtStrict[i] = _threshold_delta[key];
+    _autoSpikeMaxExcStrict[i] = _autoMaxExcursion[key];
+  }
+
+  if (_autoSpikeN == 0) return;
+
+  // Measure per-key one-sample vs two-sample behavior.
+  for (int i = 0; i < _autoSpikeN; ++i) {
+    _autoSpikeCount1[i] = 0;
+    _autoSpikeCount2[i] = 0;
+    _autoSpikeMaxExc1[i] = 0.0f;
+    _autoSpikeMaxExc2[i] = 0.0f;
+    _autoSpikeCarryoverLikely[i] = 0;
+  }
+
+  const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD;
+  const uint32_t ms = (uint32_t)max(1, seconds) * 1000UL;
+  const uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    for (int muxPos = 0; muxPos < OFFSET; ++muxPos) {
+      setKey(muxPos);
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+
+      // Sample1 then sample2 (same mux pos)
+      for (int i = 0; i < _autoSpikeN; ++i) {
+        const int key = _autoSpikeKey[i];
+        if (key != muxPos && key != muxPos + OFFSET) continue;
+        const float thr = _threshold_delta[key];
+        const float zero = _zeroVoltage[key];
+
+        const float v1 = getAdcVoltage(getAdcUnscaled(key));
+        const float exc1 = fabsf(v1 - zero);
+        if (exc1 > _autoSpikeMaxExc1[i]) _autoSpikeMaxExc1[i] = exc1;
+        if (exc1 > thr && _autoSpikeCount1[i] != 0xFFFF) _autoSpikeCount1[i]++;
+
+        const float v2 = getAdcVoltage(getAdcUnscaled(key));
+        const float exc2 = fabsf(v2 - zero);
+        if (exc2 > _autoSpikeMaxExc2[i]) _autoSpikeMaxExc2[i] = exc2;
+        if (exc2 > thr && _autoSpikeCount2[i] != 0xFFFF) _autoSpikeCount2[i]++;
+      }
+    }
+  }
+
+  for (int i = 0; i < _autoSpikeN; ++i) {
+    const float delta = _autoSpikeMaxExc1[i] - _autoSpikeMaxExc2[i];
+    if (_autoSpikeCount1[i] > 0 && _autoSpikeCount2[i] == 0) _autoSpikeCarryoverLikely[i] = 1;
+    else if (delta > 0.010f && _autoSpikeCount1[i] > _autoSpikeCount2[i]) _autoSpikeCarryoverLikely[i] = 1;
+  }
+}
+
+static int idleAuditCounts(int seconds, uint16_t* outCounts)
+{
+  static float dummyMax[NUM_KEYS];
+  return idleAuditCountsAndMax(seconds, outCounts, dummyMax);
+}
+
 bool _debugMode = false;
 int _mainLoopState = 0;
 int _currentKey = 0;
@@ -117,6 +339,8 @@ Command commandTable[] = {
   {"dcalib", handleDumpCalib, "Dump calib.csv as JSONL"},
   {"dmeta", handleDumpCalibMeta, "Dump calib_meta.csv as JSONL"},
   {"calissues", handleCalIssues, "Print last calibration issues (RAM)"},
+  {"autotune", handleAutoTuneIdle, "Auto-tune avg/sd for idle=0 (RAM only)"},
+  {"autodump", handleAutoTuneDump, "Dump last autotune run (JSONL)"},
   {"lconf", handleLoadConfig, "Load configuration (optional: program ID)"},
   {"sconf", handleSaveConfig, "Save configuration (optional: program ID)"},
   {"lcalib", handleLoadCalib, "Load calibration"},
@@ -491,7 +715,9 @@ void handleMux(float* params, int count) {
 void handleAveraging(float* params, int count) {
   if (count == 1) {
     _measureAvgStandard = (int)params[0];
-    analogReadAveraging(_measureAvgStandard);
+    // Hardware averaging caps at 32 on Teensy 4.x core. For avg>32 we keep
+    // hardware at 32 and do the rest in software (see scanKey()).
+    analogReadAveraging(_measureAvgStandard > 32 ? 32 : _measureAvgStandard);
     _println("ADC set to averaging %d.", _measureAvgStandard);
   }
 }
@@ -775,6 +1001,92 @@ void handleDumpCalibMeta(float* params, int count)
   f.close();
   if (_outputFormat) {
     Serial.println("{\"type\":\"dmeta_done\",\"ok\":1}");
+  }
+}
+
+void handleAutoTuneDump(float* params, int count)
+{
+  (void)params;
+  (void)count;
+  mcpAck();
+
+  if (!_autoHasRun) {
+    if (_outputFormat) {
+      Serial.println("{\"type\":\"autodump\",\"ok\":0,\"error\":\"no_run\"}");
+    } else {
+      _println("autodump: no run");
+    }
+    return;
+  }
+
+  if (_outputFormat) {
+    beginJson("autodump");
+    printJsonKV("ok", 1);
+    printJsonKV("complete", _autoRunComplete ? 1 : 0);
+    printJsonKV("runId", (int)_autoRunId);
+    printJsonKV("from", _autoFromKey);
+    printJsonKV("to", _autoToKey);
+    printJsonKV("tuneSeconds", _autoTuneSeconds);
+    printJsonKV("validateSeconds", _autoValidateSeconds);
+    printJsonKV("origAvg", _autoOrigAvg);
+    printJsonKV("origSd_us", _autoOrigSd);
+    printJsonKV("bestAvg", _autoBestAvg);
+    printJsonKV("bestSd_us", _autoBestSd);
+    printJsonKV("bestTuneTotal", _autoBestTuneTotal);
+    printJsonKV("bestValidateTotal", _autoBestValidateTotal);
+    printJsonKV("trialsRun", _autoTrialsRun);
+    printJsonKV("trialsLogged", _autoTrialsN);
+    printJsonKV("maxThr", _autoMaxThr);
+    printJsonKV("maxThrKey", _autoMaxThrKey, true);
+    endJson();
+
+    beginJson("autodump_rate");
+    printJsonKV("avg", _autoBestAvg);
+    printJsonKV("sd_us", _autoBestSd);
+    printJsonKV("keysPerSec", _autoKeysPerSec);
+    printJsonKV("revisitMsEst", _autoRevisitMsEst, true);
+    endJson();
+
+    beginJson("autodump_dyn");
+    printJsonKV("overMin", _autoOverMin);
+    printJsonKV("overMinKey", _autoOverMinKey);
+    printJsonKV("overMax", _autoOverMax);
+    printJsonKV("overMaxKey", _autoOverMaxKey, true);
+    endJson();
+
+    for (int i = 0; i < _autoTrialsN; ++i) {
+      beginJson("autodump_trial");
+      printJsonKV("i", i + 1);
+      printJsonKV("avg", _autoTrials[i].avg);
+      printJsonKV("sd_us", _autoTrials[i].sd);
+      printJsonKV("seconds", _autoTrials[i].seconds);
+      printJsonKV("total", _autoTrials[i].total);
+      printJsonKV("adjustedKeys", _autoTrials[i].adjustedKeys);
+      printJsonKV("maxThr", _autoTrials[i].maxThr, true);
+      endJson();
+    }
+
+    // (rate/dynamics rows emitted via dedicated variables; no synthetic trials)
+
+    // Per-key details for best candidate: only emit interesting keys to avoid spam.
+    // Criteria: offenders during validate (counts>0) OR threshold raised OR large excursion.
+    for (int k = _autoFromKey; k <= _autoToKey; ++k) {
+      if (!_hasZero[k]) continue;
+      const bool offender = (_autoCountsBest[k] > 0);
+      const bool raised = (_autoThrAfter[k] > _autoThrBefore[k] + 1e-6f);
+      const bool bigExc = (_autoMaxExcursion[k] > 0.05f);
+      if (!offender && !raised && !bigExc) continue;
+      beginJson("autodump_key");
+      printJsonKV("key", k);
+      printJsonKV("count", (int)_autoCountsBest[k]);
+      printJsonKV("maxExc", _autoMaxExcursion[k]);
+      printJsonKV("thrBefore", _autoThrBefore[k]);
+      printJsonKV("thrAfter", _autoThrAfter[k], true);
+      endJson();
+    }
+  } else {
+    _println("autodump runId=%lu best avg=%d sd=%d tuneTotal=%d validateTotal=%d",
+             (unsigned long)_autoRunId, _autoBestAvg, _autoBestSd, _autoBestTuneTotal, _autoBestValidateTotal);
   }
 }
 
@@ -1215,6 +1527,271 @@ void handleIdleAudit(float* params, int count)
       _println("idle top %d: key=%d count=%d", i + 1, topKey[i] + 1, topCnt[i]);
     }
   }
+
+  diagEnd();
+}
+
+void handleAutoTuneIdle(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+
+  // Deterministic staged autotune within ~5 minutes.
+  // Params: autotune<shortS>,<midS>,<strictS>,<topK>
+  const int shortS = (count >= 1) ? max(2, (int)params[0]) : 5;
+  const int midS = (count >= 2) ? max(10, (int)params[1]) : 20;
+  const int strictS = (count >= 3) ? max(30, (int)params[2]) : 60;
+  const int topK = (count >= 4) ? max(1, min(4, (int)params[3])) : 2;
+
+  const int origAvg = _measureAvgStandard;
+  const int origSd  = _us_delay_after_mux;
+
+  const float minThr = 0.03f;
+  const float maxThr = 0.25f;
+  const float marginShort = 0.005f;
+  const float marginMid = 0.010f;
+  const float marginStrict = 0.015f;
+
+  // Search space (include larger averaging values for stability-first tuning).
+  // Note: Arduino/Teensy analogReadAveraging officially supports up to 32.
+  const int avgCandidates[] = { 4, 8, 16, 32, 64, 128 };
+  const int sdCandidates[]  = { 5, 10, 20, 50, 100, 200 };
+
+  struct GlobalCand {
+    int avg;
+    int sd;
+    int total;
+    float worstExcess;
+  };
+  GlobalCand best[4];
+  int bestN = 0;
+
+  static uint16_t counts[NUM_KEYS];
+  static float maxExc[NUM_KEYS];
+  static float thrOrig[NUM_KEYS];
+  for (int k = 0; k < NUM_KEYS; ++k) thrOrig[k] = _threshold_delta[k];
+
+  _autoHasRun = true;
+  _autoRunComplete = false;
+  _autoRunId++;
+  _autoRunStartMs = millis();
+  _autoFromKey = _fromKey;
+  _autoToKey = _toKey;
+  _autoOrigAvg = origAvg;
+  _autoOrigSd = origSd;
+  _autoTuneSeconds = shortS;
+  _autoValidateSeconds = strictS;
+  _autoTrialsRun = 0;
+  _autoTrialsN = 0;
+  _autoBestAvg = origAvg;
+  _autoBestSd = origSd;
+  _autoBestTuneTotal = 0x7FFFFFFF;
+  _autoBestValidateTotal = 0x7FFFFFFF;
+  _autoMaxThr = 0.0f;
+  _autoMaxThrKey = -1;
+
+  // --- Stage A: coarse global search using short window ---
+  for (int ia = 0; ia < (int)(sizeof(avgCandidates)/sizeof(avgCandidates[0])); ++ia) {
+    for (int isd = 0; isd < (int)(sizeof(sdCandidates)/sizeof(sdCandidates[0])); ++isd) {
+      const int avg = avgCandidates[ia];
+      const int sd = sdCandidates[isd];
+
+      setAveragingRamOnly(avg);
+      setMuxDelayRamOnly(sd);
+
+      for (int k = _fromKey; k <= _toKey; ++k) {
+        if (_hasZero[k]) _threshold_delta[k] = max(minThr, min(maxThr, thrOrig[k]));
+      }
+
+      const int total = idleAuditCountsAndMax(shortS, counts, maxExc);
+      float worstExcess = 0.0f;
+      for (int k = _fromKey; k <= _toKey; ++k) {
+        if (!_hasZero[k]) continue;
+        const float excess = maxExc[k] - _threshold_delta[k];
+        if (excess > worstExcess) worstExcess = excess;
+      }
+
+      if (_autoTrialsN < AUTO_MAX_TRIALS) {
+        _autoTrials[_autoTrialsN++] = AutoTrial{avg, sd, shortS, total, 0, 0.0f};
+      }
+      _autoTrialsRun++;
+
+      // Insert into best[] if it improves (lower worstExcess, then total).
+      if (bestN < topK) {
+        best[bestN++] = GlobalCand{avg, sd, total, worstExcess};
+      } else {
+        int worstI = 0;
+        for (int i = 1; i < bestN; ++i) {
+          if (best[i].worstExcess > best[worstI].worstExcess) worstI = i;
+          else if (best[i].worstExcess == best[worstI].worstExcess && best[i].total > best[worstI].total) worstI = i;
+        }
+        if (worstExcess < best[worstI].worstExcess || (worstExcess == best[worstI].worstExcess && total < best[worstI].total)) {
+          best[worstI] = GlobalCand{avg, sd, total, worstExcess};
+        }
+      }
+    }
+  }
+
+  // Sort best[] by worstExcess asc, then total asc, then prefer faster (lower avg, lower sd).
+  for (int i = 0; i < bestN; ++i) {
+    for (int j = i + 1; j < bestN; ++j) {
+      bool swap = false;
+      if (best[j].worstExcess < best[i].worstExcess) swap = true;
+      else if (best[j].worstExcess == best[i].worstExcess) {
+        if (best[j].total < best[i].total) swap = true;
+        else if (best[j].total == best[i].total) {
+          if (best[j].avg < best[i].avg) swap = true;
+          else if (best[j].avg == best[i].avg && best[j].sd < best[i].sd) swap = true;
+        }
+      }
+      if (swap) { GlobalCand tmp = best[i]; best[i] = best[j]; best[j] = tmp; }
+    }
+  }
+
+  // Always pick a baseline best candidate from Stage A so autodump never shows INT_MAX.
+  if (bestN > 0) {
+    _autoBestAvg = best[0].avg;
+    _autoBestSd = best[0].sd;
+    _autoBestTuneTotal = best[0].total;
+    _autoBestValidateTotal = best[0].total; // placeholder until strict runs
+  }
+
+  // --- Stage B/C: refine candidates with mid window and strict validation ---
+  int finalValidateTotal = (bestN > 0) ? best[0].total : 0x7FFFFFFF;
+  float maxThrSeen = 0.0f;
+  int maxThrKey = -1;
+
+  for (int bi = 0; bi < bestN; ++bi) {
+    const int avg = best[bi].avg;
+    const int sd = best[bi].sd;
+    setAveragingRamOnly(avg);
+    setMuxDelayRamOnly(sd);
+
+    // Reset to calibrated thresholds
+    for (int k = _fromKey; k <= _toKey; ++k) {
+      if (_hasZero[k]) _threshold_delta[k] = max(minThr, min(maxThr, thrOrig[k]));
+    }
+
+    // Mid pass: measure and set thresholds one-shot
+    (void)idleAuditCountsAndMax(midS, counts, maxExc);
+    int adjustedKeys = 0;
+    maxThrSeen = 0.0f;
+    maxThrKey = -1;
+    for (int k = _fromKey; k <= _toKey; ++k) {
+      _autoThrBefore[k] = _threshold_delta[k];
+      _autoMaxExcursion[k] = maxExc[k];
+      if (!_hasZero[k]) { _autoThrAfter[k] = _threshold_delta[k]; continue; }
+      float thrNew = _threshold_delta[k];
+      if (maxExc[k] > thrNew) thrNew = min(maxThr, max(maxExc[k] + marginMid, thrNew));
+      if (thrNew > _threshold_delta[k] + 1e-6f) adjustedKeys++;
+      _threshold_delta[k] = thrNew;
+      _autoThrAfter[k] = thrNew;
+      if (thrNew > maxThrSeen) { maxThrSeen = thrNew; maxThrKey = k; }
+    }
+
+    // Verify mid stability
+    const int midTotalAfter = idleAuditCounts(midS, counts);
+    if (_autoTrialsN < AUTO_MAX_TRIALS) _autoTrials[_autoTrialsN++] = AutoTrial{avg, sd, midS, midTotalAfter, adjustedKeys, maxThrSeen};
+    _autoTrialsRun++;
+    // Do not require mid pass to be perfect. Strict phase will drive thresholds up.
+
+    // Strict validation: iterate. If offenders look like carryover glitches,
+    // try bumping sd first (RAM-only) and re-run strict.
+    int strictTotal = idleAuditCountsAndMax(strictS, counts, maxExc);
+    for (int iter = 0; iter < 4; ++iter) {
+      // Store counts from the current strict pass so spike diagnostics can run.
+      memcpy(_autoCountsBest, counts, sizeof(counts));
+      if (strictTotal == 0) break;
+
+      // Spike diagnostics for current offenders (short)
+      spikeDiagStrictOffenders(8);
+
+      int carryN = 0;
+      for (int i = 0; i < _autoSpikeN; ++i) if (_autoSpikeCarryoverLikely[i]) carryN++;
+
+      bool bumpedSd = false;
+      if (carryN >= 2) {
+        // Increase sd one notch and retry strict without changing thresholds.
+        const int sdStep[] = {5, 10, 20, 50, 100, 200};
+        int cur = _us_delay_after_mux;
+        int next = cur;
+        for (int si = 0; si < (int)(sizeof(sdStep)/sizeof(sdStep[0])); ++si) {
+          if (sdStep[si] == cur && si + 1 < (int)(sizeof(sdStep)/sizeof(sdStep[0]))) { next = sdStep[si+1]; break; }
+        }
+        if (next != cur) {
+          setMuxDelayRamOnly(next);
+          bumpedSd = true;
+        }
+      }
+
+      int adj = 0;
+      if (!bumpedSd) {
+        for (int k = _fromKey; k <= _toKey; ++k) {
+          if (!_hasZero[k]) continue;
+          if (counts[k] == 0) continue;
+          float thrNew = _threshold_delta[k];
+          if (maxExc[k] > thrNew) thrNew = min(maxThr, max(maxExc[k] + marginStrict, thrNew));
+          if (thrNew > _threshold_delta[k] + 1e-6f) adj++;
+          _threshold_delta[k] = thrNew;
+          if (thrNew > maxThrSeen) { maxThrSeen = thrNew; maxThrKey = k; }
+        }
+      }
+
+      if (_autoTrialsN < AUTO_MAX_TRIALS) _autoTrials[_autoTrialsN++] = AutoTrial{avg, _us_delay_after_mux, strictS, strictTotal, adj, maxThrSeen};
+      _autoTrialsRun++;
+
+      // Re-run strict measurement after adjustment or sd bump
+      strictTotal = idleAuditCountsAndMax(strictS, counts, maxExc);
+    }
+
+    // If this candidate improved, persist its state into the autotune run log.
+    if (strictTotal < finalValidateTotal) {
+      finalValidateTotal = strictTotal;
+      _autoBestAvg = avg;
+      // Use current sd (may have been bumped during strict loop)
+      _autoBestSd = _us_delay_after_mux;
+      _autoBestTuneTotal = best[bi].total;
+      _autoBestValidateTotal = strictTotal;
+      _autoMaxThr = maxThrSeen;
+      _autoMaxThrKey = maxThrKey;
+      memcpy(_autoCountsBest, counts, sizeof(counts));
+
+      // Capture the per-key arrays and spike diagnostics for this best candidate.
+      // Note: _autoThrBefore/_autoThrAfter/_autoMaxExcursion already reflect the most recent mid pass.
+      // Refresh strict max excursion into _autoMaxExcursion for offenders.
+      for (int k = _fromKey; k <= _toKey; ++k) {
+        _autoMaxExcursion[k] = maxExc[k];
+      }
+      spikeDiagStrictOffenders(8);
+    }
+
+    if (finalValidateTotal == 0) break;
+  }
+
+  // Apply best candidate settings in RAM
+  setAveragingRamOnly(_autoBestAvg);
+  setMuxDelayRamOnly(_autoBestSd);
+
+  // Record update rate + dynamics metrics into the run header fields.
+  // (These will be emitted by autodump without spamming during the run.)
+  {
+    const uint32_t ms = 2000;
+    _scanPasses = 0;
+    _scanKeyReads = 0;
+    const uint32_t t0 = millis();
+    while (millis() - t0 < ms) {
+      scanKeysNormal();
+    }
+    const float secs = (float)ms / 1000.0f;
+    _autoKeysPerSec = secs > 0 ? ((float)_scanKeyReads / secs) : 0.0f;
+    _autoRevisitMsEst = _autoKeysPerSec > 0 ? (1000.0f * (float)(_toKey - _fromKey + 1) / _autoKeysPerSec) : 0.0f;
+  }
+
+  {
+    computeDynamicsMetrics(_autoOverMin, _autoOverMax, _autoOverMinKey, _autoOverMaxKey);
+  }
+
+  _autoRunComplete = true;
 
   diagEnd();
 }

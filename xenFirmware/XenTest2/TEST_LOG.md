@@ -243,3 +243,83 @@ Board 5 results
 Overall after board 5
 - `calstat`: hasZero=279, hasThr=279, nSigma=279 (one key still uncalibrated from board 3 NotReleasing)
 - After `scalib` + `lcalib`: `calstat` unchanged
+
+## 2026-02-22 17:43:18
+
+### fw=56
+
+Autotune avg/sd + per-key thresholds (RAM-only)
+
+Goal
+- Find runtime settings that yield `idle60 total=0` (no offenders) while keeping thresholds as low as possible.
+
+Implementation notes (fw=56)
+- `autotune<tuneSeconds>,<validateSeconds>,<candidateN>` now runs a fast grid search over global `avg` and `sd` using a short idle window, then for the top candidates does a one-shot per-key threshold raise based on observed max excursion (`maxExc + 5mV` margin), then strict-validates with `idle<validateSeconds>`.
+- Logging is stored in RAM (single run) and dumped with `autodump` (non-spam during run).
+
+Run (COM3)
+- `fmt1`
+- `k1,280`
+- `autotune5,60,2`
+- `autodump`
+- `idle60`
+
+Results
+- `autodump` best: `bestAvg=32 bestSd_us=5 bestTuneTotal=0 bestValidateTotal=2` (not yet perfect)
+- Manual `idle60` immediately after: `total=1` with top offender `key=8` (0-based) count=1
+
+Analysis
+- Short tune windows (5s) can miss rare spikes that appear in strict validation (60s). The one-shot threshold update based only on tune-window max excursion can therefore under-shoot slightly.
+- Next improvement: if `validateTotal>0`, do a targeted adjustment step for keys that offend during validation (raise their thresholds using validation-window max excursion + margin), then re-validate until `total==0` or thresholds reach `maxThr`.
+
+## 2026-02-22 18:26:14
+
+### fw=58
+
+Staged autotune (avg/sd grid + per-key thresholds)
+
+Run (COM3)
+- `fmt1`
+- `k1,280`
+- `autotune5,20,60,2`
+- `autodump` (saved to local JSONL as well)
+- `idle60` (post-check)
+
+Result
+- `autodump` best: `bestAvg=32 bestSd_us=5 bestTuneTotal=0 bestValidateTotal=0`
+- Max threshold after tuning: `maxThr=0.048461` (key 86, 0-based)
+- Threshold adjustments were minimal; only one key needed a raise in the winning candidate:
+  - key 82 (0-based) maxExc~0.035779 -> thrAfter~0.045779
+
+Local artifact
+- `autotune_logs\autodump_fw58_20260222_181911.jsonl`
+
+Notes
+- This staged approach converged within the time budget and achieved strict `idle60 total=0` on the internal strict-validation stage.
+- Post-check `idle60` should be re-run occasionally (and extended to `idle90`/`idle120`) to confirm rare spikes remain suppressed.
+
+## 2026-02-22 20:47:31
+
+### fw=66
+
+Autotune bugfix: best candidate always set; idle120=0
+
+Fix
+- Autotune now always seeds `_autoBest*` from Stage A so `autodump` never reports INT_MAX sentinels.
+- Strict loop now re-measures after each adjustment so `strictTotal` is always finite.
+- `autodump` includes `complete` flag.
+
+Run (COM3)
+- `fmt1`
+- `k1,280`
+- `autotune5,20,120,2`
+- external `idle120`
+- `autodump` captured to local file
+
+Results
+- `idle120`: `total=0`
+- `autodump` best: `bestAvg=32 bestSd_us=20 bestTuneTotal=0 bestValidateTotal=0`
+- Threshold raises: none required (`maxThr=0.03` baseline)
+
+Artifacts
+- `autotune_logs\autodump_fw66_capture_20260222_204708.jsonl`

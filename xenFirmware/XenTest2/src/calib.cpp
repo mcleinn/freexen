@@ -80,8 +80,23 @@ bool readKeyForCalibration() {
 
 static inline void scanKey(int key)
 {
-    const int  adc = getAdcUnscaled(key);
-    const float v  = getAdcVoltage(adc);
+    // Support software averaging for values above what the ADC hardware supports.
+    // analogReadAveraging() caps at 32 on Teensy 4.x, so avg=64/128 mean:
+    // take multiple reads and average in software.
+    const int avg = _measureAvgStandard;
+    float v = 0.0f;
+    if (avg > 32) {
+        const int reps = (avg + 31) / 32; // 64->2, 128->4
+        float sum = 0.0f;
+        for (int i = 0; i < reps; ++i) {
+            const int adc = getAdcUnscaled(key);
+            sum += getAdcVoltage(adc);
+        }
+        v = sum / (float)reps;
+    } else {
+        const int adc = getAdcUnscaled(key);
+        v = getAdcVoltage(adc);
+    }
     peakDetect(v, key);
 }
 
