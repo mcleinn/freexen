@@ -246,3 +246,26 @@ commands:
     need_parse: false
     prompts:
       - "update leds"
+
+  dump_calib:
+    command: "dcalib\n"
+    need_parse: false
+    prompts:
+      - "dump calibration"
+      - "dump calib"
+
+  dump_calib_meta:
+    command: "dmeta\n"
+    need_parse: false
+    prompts:
+      - "dump calib meta"
+      - "dump calibration meta"
+      - "dump issues"
+
+  calibration_issues:
+    command: "calissues\n"
+    need_parse: false
+    prompts:
+      - "calibration issues"
+      - "print calibration issues"
+      - "cal issues"
