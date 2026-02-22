@@ -1,4 +1,6 @@
+#include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
+#include "xen.h"
 
 #ifndef CALIB_H
 #define CALIB_H
@@ -26,23 +28,42 @@ void loopCalibrationWaitOn();
 void loopCalibrationOn();
 void loopCalibrationOff();
 void loopCalibrationStop();
-void calibrationSweep(int& bestDacValue, float& closestError, int key, float targetVoltage);
 void saveCalibrationCSV();
 bool loadCalibrationCSV();
 void peakDetect(float voltage, int key);
 void printCalibration(int key);
-void setOffset(int key, int offset);
-void setGain(int key, int offset);
 void setThreshold(int key, float threshold);
 void scanNoise(int ms);
 void hsvToRgb(float h, float s, float v, uint8_t &r, uint8_t &g, uint8_t &b);
 void showNoise(int adc);
 void printNoiseLevels();
+void clearCalibration(int fromKey, int toKey);
+
+// Output format set by main.
+extern int _outputFormat;
+
+// Boot/debug messaging flags (set in setupCalibration / main)
+extern bool _calibAutoLoadOk;
+extern bool _bootedInDebugMode;
+
+// True if calibration arrays were modified since last load/save.
+extern bool _calibDirty;
 
 extern int _us_delay_after_dac_zero;
 extern int _us_delay_after_dac_set;
 extern int _us_delay_after_mux;
 extern int _fromKey, _toKey, _numberLED;
 extern Adafruit_NeoPixel* LEDStrip;
+
+extern float _threshold_delta[NUM_KEYS];
+extern float _zeroVoltage[NUM_KEYS];
+extern bool _hasZero[NUM_KEYS];
+extern float _maxSwing[NUM_KEYS];
+extern short _polarization[NUM_KEYS];
+extern float _noiseUnscaled[NUM_KEYS];
+
+// Runtime instrumentation (optional)
+extern volatile uint32_t _scanPasses;
+extern volatile uint32_t _scanKeyReads;
 
 #endif // CALIB_H

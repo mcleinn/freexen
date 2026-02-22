@@ -15,6 +15,62 @@
 #include "midi.h"
 #include "calib.h"
 
+// Forward decls for commands referenced by commandTable.
+void handleDumpCalib(float* params, int count);
+
+int _outputFormat = 0; // 0=human, 1=jsonl
+bool _diagActive = false;
+
+// Bump this on every firmware change that touches serial protocol or behavior.
+static const int XEN_FW_VERSION = 49;
+
+static inline void mcpAck()
+{
+  // mcp2serial v0.1.0 only reads whatever is already available ~100ms after
+  // sending. Long-running commands must emit an immediate line so the MCP
+  // tool call doesn't look like a timeout.
+  Serial.println("OK");
+}
+
+static inline void diagBegin()
+{
+  _diagActive = true;
+  // Stop any lingering LED state and make tests own LEDs.
+  setColorAll(0, 0, 0);
+  updateAllLEDs();
+}
+
+static inline void diagEnd()
+{
+  _diagActive = false;
+  // Return LEDs to configured state.
+  updateAllLEDs();
+}
+
+static void printJsonKV(const char* k, const char* v, bool last=false) {
+  Serial.print("\""); Serial.print(k); Serial.print("\":\""); Serial.print(v); Serial.print("\"");
+  if (!last) Serial.print(",");
+}
+
+static void printJsonKV(const char* k, int v, bool last=false) {
+  Serial.print("\""); Serial.print(k); Serial.print("\":"); Serial.print(v);
+  if (!last) Serial.print(",");
+}
+
+static void printJsonKV(const char* k, float v, bool last=false) {
+  Serial.print("\""); Serial.print(k); Serial.print("\":"); Serial.print(v, 6);
+  if (!last) Serial.print(",");
+}
+
+static void beginJson(const char* type) {
+  Serial.print("{");
+  printJsonKV("type", type);
+}
+
+static void endJson() {
+  Serial.println("}");
+}
+
 bool _debugMode = false;
 int _mainLoopState = 0;
 int _currentKey = 0;
@@ -28,16 +84,34 @@ Command commandTable[] = {
   {"k", handleKey, "Set key index (no arg for all, otherwise key or from,to)"},
   {"m", handleMux, "Set mux"},
   {"kc", handleKeyWithColor, "Set key index (no arg for all, otherwise key or from,to)"},
-  {"o", handleDAC, "Set DAC value (0 to 4095), optional 2nd param = channel"},
   {"a", handleAveraging, "Set averaging value to 1,2,4,8,16,32"},
-  {"g", handleDPot, "Set digital potentiometer value (0 to 255), optional 2nd param = channel"},
+  {"sd", handleMuxDelay, "Set mux settle delay in us"},
   {"t", handleThreshold, "Set threshold"},
+  {"fmt", handleFormat, "Set output format (0=human, 1=jsonl)"},
   {"c", handleSetColorSelected, "Set color for selected keys (three parameters 0-255)"},
   {"ca", handleSetColorAll, "Set color for all keys (three parameters 0-255)"},
   {"x", handleCalibrate, "Enter calibration mode"},
   {"r", handleRun, "Enter run mode"},
   {"p", handlePlot, "Enter plot mode"},
-  {"n", handleMeasureNoise, "Measure noise for selected keys (duration in s, adc 0 or adc 1)"},
+  {"n", handleMeasureNoise, "Measure noise for selected keys (duration in s)"},
+  {"ccalib", handleClearCalib, "Clear calibration for selected keys"},
+  {"rk", handleReadKey, "Read one key snapshot (optional: key)"},
+  {"rs", handleReadStats, "Read key stats (key,ms)"},
+  {"pr", handleProblemReport, "Noise/problem report for selected keys (seconds)"},
+  {"rate", handleRate, "Scan rate estimate (ms)"},
+  {"idle", handleIdleAudit, "Runtime idle false-trigger audit (seconds)"},
+  {"rperf", handleRuntimePerf, "Runtime scan performance (seconds)"},
+  {"st", handleSettleTest, "Settling test (keyA,keyB,delay_us,samples)"},
+  {"sts", handleSettleSweep, "Settling sweep (keyA,keyB)"},
+  {"testa", handleTest0, "Test A: self check"},
+  {"testb", handleTest1, "Test B: sentinel press"},
+  {"testc", handleTest2, "Test C: settling"},
+  {"testd", handleTest3, "Test D: noise survey (seconds)"},
+  {"teste", handleTest6, "Test E: perf sweep"},
+  {"rst", handleReset, "Software reset"},
+  {"ver", handleVersion, "Print firmware version"},
+  {"calstat", handleCalStat, "Calibration status (all keys)"},
+  {"dcalib", handleDumpCalib, "Dump calib.csv as JSONL"},
   {"lconf", handleLoadConfig, "Load configuration (optional: program ID)"},
   {"sconf", handleSaveConfig, "Save configuration (optional: program ID)"},
   {"lcalib", handleLoadCalib, "Load calibration"},
@@ -52,11 +126,10 @@ const int commandCount = sizeof(commandTable) / sizeof(Command);
 void setup() {
   Serial.begin(115200);
 
-  unsigned long timeout = millis();
-
   bool connected = Serial && Serial.dtr();  
   if (connected) {
     _debugMode = true;
+    _bootedInDebugMode = true;
     Serial.println("Debug mode enabled.");
     _mainLoopState = 0;
     _program = 9;
@@ -82,6 +155,19 @@ void setup() {
   if (!connected)
     loadCalibrationCSV();
 
+  // Boot status banner
+  if (Serial && Serial.dtr()) {
+    if (_outputFormat) {
+      beginJson("boot");
+      printJsonKV("fw", XEN_FW_VERSION);
+      printJsonKV("bootDebug", _bootedInDebugMode ? 1 : 0);
+      printJsonKV("calibAutoLoadOk", _calibAutoLoadOk ? 1 : 0, true);
+      endJson();
+    } else {
+      _println("boot fw=%d bootDebug=%d calibAutoLoadOk=%d", XEN_FW_VERSION, _bootedInDebugMode ? 1 : 0, _calibAutoLoadOk ? 1 : 0);
+    }
+  }
+
   Serial.println("Ready to receive commands (e.g. a123)...");
 }
 
@@ -89,19 +175,20 @@ void loop() {
   if (_debugMode)
     checkSerial();
 
+  // Diagnostics/tests take over the device (LEDs, timing). Do not run normal scanning.
+  if (_diagActive) {
+    return;
+  }
+
   if (_mainLoopState == 1) {
     // Plotter mode
     _print("Min:0.0,");
     for (int k=_fromKey; k<= _toKey; k++) {
       setKey(k);
-      int adcMain1 = getAdcMain(k);
       int adcUnscaled1 = getAdcUnscaled(k);
-
-      float scaledVoltage1 = getAdcVoltage(adcMain1);
       float unscaledVoltage1 = getAdcVoltage(adcUnscaled1);
 
-      //_print("S%d:%f,U%d:%f,", k, scaledVoltage1, k, unscaledVoltage1);
-      _print("S%d:%f,", k+1, scaledVoltage1);
+      _print("U%d:%f,", k+1, unscaledVoltage1);
     }
     _println("Max:3.3");
     delay(_ms_plot_mode_delay);
@@ -120,14 +207,10 @@ void loop() {
     // Normal operation mode
     scanKeysNormal();
   } else if (_mainLoopState == 4) {
-    // Noise 0 operation mode
+    // Noise operation mode
     scanNoise(500);
     showNoise(0);
-  } else if (_mainLoopState == 5) {
-    // Noise 1 operation mode
-    scanNoise(500);
-    showNoise(1);
-  } 
+  }
 
   LEDStrip->show();
   updateDebugState();
@@ -139,7 +222,29 @@ void updateDebugState()
 
     if (connected && !_debugMode) {            
       _debugMode      = true;
+
+      // When debug is enabled (often after connecting later), suppress any
+      // running loop modes that spam serial (e.g. calibration/plot/noise).
+      // The user can explicitly re-enter a loop mode via commands.
+      if (_mainLoopState != 2) {
+        _mainLoopState = 0;
+      }
+
+      if (_outputFormat) {
+        beginJson("debug");
+        printJsonKV("enabled", 1);
+        printJsonKV("bootDebug", _bootedInDebugMode ? 1 : 0);
+        printJsonKV("enteredLater", _bootedInDebugMode ? 0 : 1);
+        printJsonKV("fw", XEN_FW_VERSION);
+        printJsonKV("calibAutoLoadOk", _calibAutoLoadOk ? 1 : 0, true);
+        endJson();
+      } else {
         Serial.println("Debug mode enabled.");
+        _println("debug enteredLater=%d fw=%d calibAutoLoadOk=%d",
+                _bootedInDebugMode ? 0 : 1,
+                XEN_FW_VERSION,
+                _calibAutoLoadOk ? 1 : 0);
+      }
     }
     else if (!connected && _debugMode) {        
       _debugMode      = false;
@@ -153,6 +258,12 @@ void checkSerial() {
   
   while (Serial.available() > 0) {
     char incomingByte = (char)Serial.read();
+
+    // mcp2serial and many terminals send CRLF. Ignore CR to avoid
+    // corrupting the next command in the buffer.
+    if (incomingByte == '\r') {
+      continue;
+    }
     
     if (incomingByte == '\n') {
       // Terminate the string
@@ -290,23 +401,6 @@ void handleKeyWithColor(float* params, int count) {
   updateAllLEDs();
 }
 
-void handleDAC(float* params, int count) {
-  if (count >= 1) {
-    int value = (int)params[0];
-    setOffset(_currentKey, value); // for calib conf
-    setDacMain(_currentKey, value); // actual output
-  }
-}
-
-void handleDPot(float* params, int count) {
-  if (count >= 1) {
-    int value = (int)params[0];
-    setGain(_currentKey, value); // for calib conf
-    setDPot(_currentKey, value); // actual output
-    _println("DPot changed to %d", value);
-  }
-}
-
 void handleThreshold(float* params, int count) {
   if (count >= 1) {
     for (int k=_fromKey; k <= _toKey; k++) 
@@ -400,12 +494,994 @@ void handleMeasureNoise(float* params, int count) {
   else if (count >= 1)
     scanNoise((int)(params[0]*1000));
 
-  if (count < 2)
-    showNoise(0);
-  else 
-    showNoise((int)params[1]);
+  showNoise(0);
 
   printNoiseLevels();
+}
+
+void handleFormat(float* params, int count)
+{
+  if (count >= 1) {
+    _outputFormat = ((int)params[0]) ? 1 : 0;
+  }
+
+  if (_outputFormat) {
+    beginJson("fmt");
+    printJsonKV("value", _outputFormat, true);
+    endJson();
+  } else {
+    _println("Format set to %s", _outputFormat ? "jsonl" : "human");
+  }
+}
+
+void handleMuxDelay(float* params, int count)
+{
+  if (count >= 1) {
+    _us_delay_after_mux = max(0, (int)params[0]);
+  }
+
+  if (_outputFormat) {
+    beginJson("sd");
+    printJsonKV("us", _us_delay_after_mux, true);
+    endJson();
+  } else {
+    _println("Mux settle delay now %d us", _us_delay_after_mux);
+  }
+}
+
+void handleReset(float* params, int count)
+{
+  (void)params; (void)count;
+  if (_outputFormat) {
+    beginJson("rst");
+    printJsonKV("ok", 1, true);
+    endJson();
+  } else {
+    _println("Resetting...");
+  }
+  delay(100);
+  SCB_AIRCR = 0x05FA0004; // system reset request
+  while (1) {}
+}
+
+void handleVersion(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+  if (_outputFormat) {
+    beginJson("ver");
+    printJsonKV("fw", XEN_FW_VERSION, true);
+    endJson();
+  } else {
+    _println("fw=%d", XEN_FW_VERSION);
+  }
+}
+
+void handleCalStat(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+
+  int hasZero = 0;
+  int hasThr = 0;
+  float maxSigma = 0.0f;
+  float minSigma = 1e9f;
+  int nSigma = 0;
+
+  for (int k = 0; k < NUM_KEYS; ++k) {
+    if (_hasZero[k]) hasZero++;
+    if (_threshold_delta[k] > 1e-6f) hasThr++;
+    const float s = _noiseUnscaled[k];
+    if (s > 0.0f) {
+      nSigma++;
+      if (s > maxSigma) maxSigma = s;
+      if (s < minSigma) minSigma = s;
+    }
+  }
+
+  if (_outputFormat) {
+    beginJson("calstat");
+    printJsonKV("total", NUM_KEYS);
+    printJsonKV("hasZero", hasZero);
+    printJsonKV("hasThr", hasThr);
+    printJsonKV("nSigma", nSigma);
+    printJsonKV("minSigma", (nSigma ? minSigma : 0.0f));
+    printJsonKV("maxSigma", maxSigma, true);
+    endJson();
+  } else {
+    _println("calstat total=%d hasZero=%d hasThr=%d nSigma=%d minSigma=%.6f maxSigma=%.6f",
+             NUM_KEYS, hasZero, hasThr, nSigma, (nSigma ? minSigma : 0.0f), maxSigma);
+  }
+}
+
+static void jsonPrintString(const char* s)
+{
+  // Minimal JSON string escaping for ASCII-friendly content.
+  Serial.print('"');
+  for (const char* p = s; *p; ++p) {
+    const char c = *p;
+    if (c == '"' || c == '\\') {
+      Serial.print('\\');
+      Serial.print(c);
+    } else if (c == '\n') {
+      Serial.print("\\n");
+    } else if (c == '\r') {
+      Serial.print("\\r");
+    } else if (c == '\t') {
+      Serial.print("\\t");
+    } else {
+      Serial.print(c);
+    }
+  }
+  Serial.print('"');
+}
+
+void handleDumpCalib(float* params, int count)
+{
+  (void)params;
+  (void)count;
+  mcpAck();
+
+  // Report whether current RAM calibration differs from last loaded/saved state.
+  if (_outputFormat) {
+    beginJson("dcalib_start");
+    printJsonKV("source", "ram");
+    printJsonKV("dirty", _calibDirty ? 1 : 0, true);
+    endJson();
+  } else {
+    _println("dcalib source=ram dirty=%d", _calibDirty ? 1 : 0);
+  }
+
+  for (int key = 0; key < NUM_KEYS; ++key) {
+    int board = 0, boardKey = 0;
+    getBoardAndBoardKey(key, board, boardKey);
+    Serial.print("{\"type\":\"dcalib_row\",\"key\":");
+    Serial.print(key);
+    Serial.print(",\"board\":");
+    Serial.print(board);
+    Serial.print(",\"boardKey\":");
+    Serial.print(boardKey);
+    Serial.print(",\"hasZero\":");
+    Serial.print(_hasZero[key] ? 1 : 0);
+    Serial.print(",\"maxSwing\":");
+    Serial.print(_maxSwing[key], 6);
+    Serial.print(",\"pol\":");
+    Serial.print((int)_polarization[key]);
+    Serial.print(",\"sigma\":");
+    Serial.print(_noiseUnscaled[key], 6);
+    Serial.print(",\"thr\":");
+    Serial.print(_threshold_delta[key], 6);
+    Serial.print(",\"zero\":");
+    Serial.print(_zeroVoltage[key], 6);
+    Serial.println("}");
+  }
+
+  Serial.println("{\"type\":\"dcalib_done\",\"ok\":1}");
+}
+
+void handleClearCalib(float* params, int count)
+{
+  (void)params;
+  (void)count;
+
+  clearCalibration(_fromKey, _toKey);
+  _println("Cleared calibration for keys %d to %d", _fromKey + 1, _toKey + 1);
+}
+
+void handleReadKey(float* params, int count)
+{
+  mcpAck();
+  int key = _fromKey;
+  if (count >= 1) key = (int)params[0] - 1;
+  if (key < 0 || key >= NUM_KEYS) return;
+
+  setKey(key);
+  const int adc = getAdcUnscaled(key);
+  const float v = getAdcVoltage(adc);
+
+  // peakDetect internal state isn't exposed; provide basic derived values.
+  const float zero = _zeroVoltage[key];
+  const float thr = _threshold_delta[key];
+  const float swing = _hasZero[key] ? fabsf(v - zero) : 0.0f;
+
+  int board, boardKey;
+  getBoardAndBoardKey(key, board, boardKey);
+
+  if (_outputFormat) {
+    beginJson("rk");
+    printJsonKV("key", key);
+    printJsonKV("board", board);
+    printJsonKV("boardKey", boardKey);
+    printJsonKV("adc", adc);
+    printJsonKV("v", v);
+    printJsonKV("hasZero", _hasZero[key] ? 1 : 0);
+    printJsonKV("zero", zero);
+    printJsonKV("swing", swing);
+    printJsonKV("thr", thr);
+    printJsonKV("maxSwing", _maxSwing[key]);
+    printJsonKV("pol", (int)_polarization[key], true);
+    endJson();
+  } else {
+    _println("rk key=%d board=%d boardKey=%d adc=%d v=%.4f zero=%s%.4f swing=%.4f thr=%.4f maxSwing=%.4f pol=%d",
+             key + 1, board, boardKey, adc, v,
+             _hasZero[key] ? "" : "(unset)", zero,
+             swing, thr, _maxSwing[key], (int)_polarization[key]);
+  }
+}
+
+void handleReadStats(float* params, int count)
+{
+  mcpAck();
+  if (count < 1) return;
+  const int key = (int)params[0] - 1;
+  const int ms = (count >= 2) ? (int)params[1] : 500;
+  if (key < 0 || key >= NUM_KEYS) return;
+
+  setKey(key);
+  const uint32_t t0 = millis();
+  uint32_t n = 0;
+  float mean = 0.0f;
+  float m2 = 0.0f;
+  float vMin = 1e9f;
+  float vMax = -1e9f;
+  while (millis() - t0 < (uint32_t)ms) {
+    const float v = getAdcVoltage(getAdcUnscaled(key));
+    if (v < vMin) vMin = v;
+    if (v > vMax) vMax = v;
+    ++n;
+    const float delta = v - mean;
+    mean += delta / n;
+    m2 += delta * (v - mean);
+  }
+  const float sigma = (n > 1) ? sqrtf(m2 / (n - 1)) : 0.0f;
+  int board, boardKey;
+  getBoardAndBoardKey(key, board, boardKey);
+
+  if (_outputFormat) {
+    beginJson("rs");
+    printJsonKV("key", key);
+    printJsonKV("board", board);
+    printJsonKV("boardKey", boardKey);
+    printJsonKV("ms", ms);
+    printJsonKV("n", (int)n);
+    printJsonKV("min", vMin);
+    printJsonKV("mean", mean);
+    printJsonKV("max", vMax);
+    printJsonKV("sigma", sigma, true);
+    endJson();
+  } else {
+    _println("rs key=%d n=%lu min=%.4f mean=%.4f max=%.4f sigma=%.6f",
+             key + 1, (unsigned long)n, vMin, mean, vMax, sigma);
+  }
+}
+
+void handleProblemReport(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+  const int seconds = (count >= 1) ? max(1, (int)params[0]) : 2;
+  const int ms = seconds * 1000;
+  scanNoise(ms);
+
+  const float thresholdMin = 0.03f;
+  const float kSigma = 8.0f;
+
+  if (_outputFormat) {
+    beginJson("pr");
+    printJsonKV("from", _fromKey);
+    printJsonKV("to", _toKey);
+    printJsonKV("seconds", seconds, true);
+    endJson();
+  } else {
+    _println("pr seconds=%d range=%d..%d", seconds, _fromKey + 1, _toKey + 1);
+  }
+
+  // Stream rows (JSONL) or CSV
+  if (_outputFormat) {
+    for (int k = _fromKey; k <= _toKey; ++k) {
+      const float sigma = _noiseUnscaled[k];
+      const float thrSuggest = max(thresholdMin, kSigma * sigma);
+      beginJson("pr_row");
+      printJsonKV("key", k);
+      printJsonKV("sigma", sigma);
+      printJsonKV("thr", _threshold_delta[k]);
+      printJsonKV("thrSuggest", thrSuggest);
+      printJsonKV("zero", _zeroVoltage[k]);
+      printJsonKV("hasZero", _hasZero[k] ? 1 : 0, true);
+      endJson();
+    }
+  } else {
+    Serial.println("key,sigmaV,thrV,thrSuggestV,zeroV,hasZero");
+    for (int k = _fromKey; k <= _toKey; ++k) {
+      const float sigma = _noiseUnscaled[k];
+      const float thrSuggest = max(thresholdMin, kSigma * sigma);
+      Serial.print(k + 1);
+      Serial.print(",");
+      Serial.print(sigma, 6);
+      Serial.print(",");
+      Serial.print(_threshold_delta[k], 6);
+      Serial.print(",");
+      Serial.print(thrSuggest, 6);
+      Serial.print(",");
+      Serial.print(_zeroVoltage[k], 6);
+      Serial.print(",");
+      Serial.println(_hasZero[k] ? 1 : 0);
+    }
+  }
+
+  diagEnd();
+}
+
+void handleRate(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+  const int ms = (count >= 1) ? max(100, (int)params[0]) : 1000;
+  const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD;
+
+  uint32_t steps = 0;
+  uint32_t reads = 0;
+  const uint32_t t0 = millis();
+  while (millis() - t0 < (uint32_t)ms) {
+    for (int muxPos = 0; muxPos < OFFSET; ++muxPos) {
+      setKey(muxPos);
+      // two reads (A/B banks) when in range, approximate by range coverage
+      const int keyA = muxPos;
+      const int keyB = muxPos + OFFSET;
+      if (keyA >= _fromKey && keyA <= _toKey) { (void)getAdcUnscaled(keyA); ++reads; }
+      if (keyB >= _fromKey && keyB <= _toKey) { (void)getAdcUnscaled(keyB); ++reads; }
+      ++steps;
+    }
+  }
+  const float secs = (float)ms / 1000.0f;
+  const float stepsPerSec = steps / secs;
+  const float readsPerSec = reads / secs;
+  const float keysPerSec = readsPerSec; // one ADC read per key measurement
+
+  if (_outputFormat) {
+    beginJson("rate");
+    printJsonKV("ms", ms);
+    printJsonKV("muxStepsPerSec", stepsPerSec);
+    printJsonKV("adcReadsPerSec", readsPerSec);
+    printJsonKV("keysPerSec", keysPerSec, true);
+    endJson();
+  } else {
+    _println("rate ms=%d muxSteps/s=%.1f adcReads/s=%.1f keys/s=%.1f", ms, stepsPerSec, readsPerSec, keysPerSec);
+  }
+
+  diagEnd();
+}
+
+static float keySteadyVoltage(int key)
+{
+  setKey(key);
+  delayMicroseconds(max(0, _us_delay_after_mux));
+  // take a small average of a few samples
+  float sum = 0.0f;
+  const int n = 8;
+  for (int i = 0; i < n; ++i) {
+    sum += getAdcVoltage(getAdcUnscaled(key));
+  }
+  return sum / (float)n;
+}
+
+void handleSettleTest(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+  if (count < 4) { diagEnd(); return; }
+  const int keyA = (int)params[0] - 1;
+  const int keyB = (int)params[1] - 1;
+  const int delayUs = max(0, (int)params[2]);
+  const int samples = max(1, (int)params[3]);
+  if (keyA < 0 || keyA >= NUM_KEYS || keyB < 0 || keyB >= NUM_KEYS) return;
+
+  const float steadyA = keySteadyVoltage(keyA);
+  const float steadyB = keySteadyVoltage(keyB);
+
+  auto measureDir = [&](int fromKey, int toKey, float steadyTo, float &meanErr, float &maxErr) {
+    meanErr = 0.0f;
+    maxErr = 0.0f;
+    for (int i = 0; i < samples; ++i) {
+      setKey(fromKey);
+      delayMicroseconds(delayUs);
+      setKey(toKey);
+      delayMicroseconds(delayUs);
+      const float v = getAdcVoltage(getAdcUnscaled(toKey));
+      const float err = fabsf(v - steadyTo);
+      meanErr += err;
+      if (err > maxErr) maxErr = err;
+    }
+    meanErr /= (float)samples;
+  };
+
+  float meanAB, maxAB, meanBA, maxBA;
+  measureDir(keyA, keyB, steadyB, meanAB, maxAB);
+  measureDir(keyB, keyA, steadyA, meanBA, maxBA);
+
+  if (_outputFormat) {
+    beginJson("st");
+    printJsonKV("keyA", keyA);
+    printJsonKV("keyB", keyB);
+    printJsonKV("delay_us", delayUs);
+    printJsonKV("samples", samples);
+    printJsonKV("steadyA", steadyA);
+    printJsonKV("steadyB", steadyB);
+    printJsonKV("meanErrAB", meanAB);
+    printJsonKV("maxErrAB", maxAB);
+    printJsonKV("meanErrBA", meanBA);
+    printJsonKV("maxErrBA", maxBA, true);
+    endJson();
+  } else {
+    _println("st A=%d B=%d delay_us=%d samples=%d steadyA=%.4f steadyB=%.4f meanErrAB=%.6f maxErrAB=%.6f meanErrBA=%.6f maxErrBA=%.6f",
+             keyA + 1, keyB + 1, delayUs, samples, steadyA, steadyB, meanAB, maxAB, meanBA, maxBA);
+  }
+
+  diagEnd();
+}
+
+void handleSettleSweep(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+  if (count < 2) { diagEnd(); return; }
+  const int keyA = (int)params[0] - 1;
+  const int keyB = (int)params[1] - 1;
+  if (keyA < 0 || keyA >= NUM_KEYS || keyB < 0 || keyB >= NUM_KEYS) return;
+
+  const int delays[] = {0, 5, 10, 20, 50, 100, 200};
+  const int samples = 50;
+
+  if (_outputFormat) {
+    beginJson("sts");
+    printJsonKV("keyA", keyA);
+    printJsonKV("keyB", keyB);
+    printJsonKV("samples", samples, true);
+    endJson();
+  } else {
+    _println("sts keyA=%d keyB=%d", keyA + 1, keyB + 1);
+    Serial.println("delay_us,meanErrAB,maxErrAB,meanErrBA,maxErrBA");
+  }
+
+  float bestDelay = delays[0];
+  float bestScore = 1e9f;
+
+  for (int i = 0; i < (int)(sizeof(delays)/sizeof(delays[0])); ++i) {
+    float meanAB, maxAB, meanBA, maxBA;
+    float steadyA = keySteadyVoltage(keyA);
+    float steadyB = keySteadyVoltage(keyB);
+    // reuse settle test core
+    float tmpMean, tmpMax;
+    // A->B
+    tmpMean = 0; tmpMax = 0;
+    for (int s = 0; s < samples; ++s) {
+      setKey(keyA);
+      delayMicroseconds(delays[i]);
+      setKey(keyB);
+      delayMicroseconds(delays[i]);
+      const float v = getAdcVoltage(getAdcUnscaled(keyB));
+      const float err = fabsf(v - steadyB);
+      tmpMean += err;
+      if (err > tmpMax) tmpMax = err;
+    }
+    meanAB = tmpMean / (float)samples;
+    maxAB = tmpMax;
+    // B->A
+    tmpMean = 0; tmpMax = 0;
+    for (int s = 0; s < samples; ++s) {
+      setKey(keyB);
+      delayMicroseconds(delays[i]);
+      setKey(keyA);
+      delayMicroseconds(delays[i]);
+      const float v = getAdcVoltage(getAdcUnscaled(keyA));
+      const float err = fabsf(v - steadyA);
+      tmpMean += err;
+      if (err > tmpMax) tmpMax = err;
+    }
+    meanBA = tmpMean / (float)samples;
+    maxBA = tmpMax;
+
+    const float score = max(maxAB, maxBA);
+    if (score < bestScore) { bestScore = score; bestDelay = (float)delays[i]; }
+
+    if (_outputFormat) {
+      beginJson("sts_row");
+      printJsonKV("delay_us", delays[i]);
+      printJsonKV("meanErrAB", meanAB);
+      printJsonKV("maxErrAB", maxAB);
+      printJsonKV("meanErrBA", meanBA);
+      printJsonKV("maxErrBA", maxBA, true);
+      endJson();
+    } else {
+      Serial.print(delays[i]); Serial.print(",");
+      Serial.print(meanAB, 6); Serial.print(",");
+      Serial.print(maxAB, 6); Serial.print(",");
+      Serial.print(meanBA, 6); Serial.print(",");
+      Serial.println(maxBA, 6);
+    }
+  }
+
+  if (_outputFormat) {
+    beginJson("sts_best");
+    printJsonKV("delay_us", (int)bestDelay);
+    printJsonKV("score", bestScore, true);
+    endJson();
+  } else {
+    _println("sts best delay_us=%d score(maxErr)=%.6f", (int)bestDelay, bestScore);
+  }
+
+  diagEnd();
+}
+
+void handleIdleAudit(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+
+  const int seconds = (count >= 1) ? max(1, (int)params[0]) : 30;
+  const uint32_t ms = (uint32_t)seconds * 1000UL;
+
+  // Simple idle audit based on current calibration thresholds.
+  // Keys without baseline are skipped.
+  static uint16_t counts[NUM_KEYS];
+  memset(counts, 0, sizeof(counts));
+
+  const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD;
+  const uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    for (int muxPos = 0; muxPos < OFFSET; ++muxPos) {
+      const int keyA = muxPos;
+      const int keyB = muxPos + OFFSET;
+
+      const bool doA = (keyA >= _fromKey) && (keyA <= _toKey) && _hasZero[keyA];
+      const bool doB = (keyB >= _fromKey) && (keyB <= _toKey) && _hasZero[keyB];
+      if (!doA && !doB) continue;
+
+      setKey(muxPos);
+
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+
+      if (doA) {
+        const float v = getAdcVoltage(getAdcUnscaled(keyA));
+        const float swing = fabsf(v - _zeroVoltage[keyA]);
+        if (swing > _threshold_delta[keyA] && counts[keyA] != 0xFFFF) counts[keyA]++;
+      }
+      if (doB) {
+        const float v = getAdcVoltage(getAdcUnscaled(keyB));
+        const float swing = fabsf(v - _zeroVoltage[keyB]);
+        if (swing > _threshold_delta[keyB] && counts[keyB] != 0xFFFF) counts[keyB]++;
+      }
+    }
+  }
+
+  // Summarize top offenders
+  int total = 0;
+  int topKey[10];
+  int topCnt[10];
+  for (int i = 0; i < 10; ++i) { topKey[i] = -1; topCnt[i] = -1; }
+
+  for (int k = _fromKey; k <= _toKey; ++k) {
+    const int c = counts[k];
+    total += c;
+    for (int i = 0; i < 10; ++i) {
+      if (c > topCnt[i]) {
+        for (int j = 9; j > i; --j) { topCnt[j] = topCnt[j-1]; topKey[j] = topKey[j-1]; }
+        topCnt[i] = c;
+        topKey[i] = k;
+        break;
+      }
+    }
+  }
+
+  if (_outputFormat) {
+    beginJson("idle");
+    printJsonKV("seconds", seconds);
+    printJsonKV("from", _fromKey);
+    printJsonKV("to", _toKey);
+    printJsonKV("total", total, true);
+    endJson();
+    for (int i = 0; i < 10; ++i) {
+      if (topKey[i] < 0) break;
+      beginJson("idle_top");
+      printJsonKV("rank", i + 1);
+      printJsonKV("key", topKey[i]);
+      printJsonKV("count", topCnt[i], true);
+      endJson();
+    }
+  } else {
+    _println("idle seconds=%d total=%d", seconds, total);
+    for (int i = 0; i < 10; ++i) {
+      if (topKey[i] < 0) break;
+      _println("idle top %d: key=%d count=%d", i + 1, topKey[i] + 1, topCnt[i]);
+    }
+  }
+
+  diagEnd();
+}
+
+void handleRuntimePerf(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+
+  const int seconds = (count >= 1) ? max(1, (int)params[0]) : 5;
+  const uint32_t ms = (uint32_t)seconds * 1000UL;
+
+  _scanPasses = 0;
+  _scanKeyReads = 0;
+  const uint32_t t0 = millis();
+  // Temporarily run the normal scan in a tight loop for measurement.
+  // This approximates runtime load without MIDI/LED extras.
+  while (millis() - t0 < ms) {
+    scanKeysNormal();
+  }
+
+  const float secs = (float)ms / 1000.0f;
+  const float passesPerSec = (float)_scanPasses / secs;
+  const float readsPerSec = (float)_scanKeyReads / secs;
+  const float revisitMs = readsPerSec > 0 ? (1000.0f * (float)(_toKey - _fromKey + 1) / readsPerSec) : 0.0f;
+
+  if (_outputFormat) {
+    beginJson("rperf");
+    printJsonKV("seconds", seconds);
+    printJsonKV("from", _fromKey);
+    printJsonKV("to", _toKey);
+    printJsonKV("passesPerSec", passesPerSec);
+    printJsonKV("keysPerSec", readsPerSec);
+    printJsonKV("revisitMsEst", revisitMs, true);
+    endJson();
+  } else {
+    _println("rperf seconds=%d keys/s=%.1f passes/s=%.2f revisitMsEst=%.2f", seconds, readsPerSec, passesPerSec, revisitMs);
+  }
+
+  diagEnd();
+}
+
+void handleTest0(float* params, int count)
+{
+  (void)params; (void)count;
+  if (_outputFormat) {
+    beginJson("t0");
+    printJsonKV("avg", _measureAvgStandard);
+    printJsonKV("sd_us", _us_delay_after_mux);
+    printJsonKV("range_from", _fromKey);
+    printJsonKV("range_to", _toKey, true);
+    endJson();
+  } else {
+    _println("t0 avg=%d sd_us=%d range=%d..%d", _measureAvgStandard, _us_delay_after_mux, _fromKey + 1, _toKey + 1);
+  }
+}
+
+struct TestbResult {
+  int key;
+  float baseline;
+  float sigma;
+  float thr;
+  float maxSwing;
+  int pol; // -1 or +1 (sign of first threshold crossing)
+  int hits;
+  int detected;
+  int detectMs;
+};
+
+static bool waitForPress(int key, uint32_t timeoutMs, TestbResult &out)
+{
+  // Robust press detector that does NOT require prior calibration.
+  // 1) measure baseline + sigma for a short window
+  // 2) consider "pressed" only if abs(v-baseline) exceeds a noise-based threshold
+  //    for a few consecutive samples.
+
+  const float minThr = 0.03f; // 30 mV
+  const float kSigma = 8.0f;
+  const int consecutive = 3;
+
+  // Assume mux is already set to this key when called.
+  // Baseline window (LED blue = hands off)
+  setColorAll(0, 0, 0);
+  setColor(key, 0, 0, 255);
+  updateAllLEDs();
+
+  const uint32_t tBase0 = millis();
+  const uint32_t baseMs = 400;
+  uint32_t n = 0;
+  float mean = 0.0f;
+  float m2 = 0.0f;
+  float vMin = 1e9f;
+  float vMax = -1e9f;
+
+  while (millis() - tBase0 < baseMs) {
+    setKey(key);
+    (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+    (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+    const float v = getAdcVoltage(getAdcUnscaled(key));
+    if (v < vMin) vMin = v;
+    if (v > vMax) vMax = v;
+    ++n;
+    const float delta = v - mean;
+    mean += delta / n;
+    m2 += delta * (v - mean);
+    delay(2);
+  }
+
+  const float sigma = (n > 1) ? sqrtf(m2 / (n - 1)) : 0.0f;
+  const float baseline = mean;
+  const float thr = max(minThr, kSigma * sigma);
+
+  // White = press now
+  setColor(key, 255, 255, 255);
+  updateAllLEDs();
+
+  out.key = key;
+  out.baseline = baseline;
+  out.sigma = sigma;
+  out.thr = thr;
+  out.maxSwing = 0.0f;
+  out.pol = 0;
+  out.hits = 0;
+  out.detected = 0;
+  out.detectMs = -1;
+
+  if (!_outputFormat) {
+    _println("testb key=%d baseline=%.4fV sigma=%.6f thr=%.4fV (min=%.4f max=%.4f)",
+             key + 1, baseline, sigma, thr, vMin, vMax);
+  }
+
+  // Detection window
+  const uint32_t t0 = millis();
+  int hit = 0;
+  bool reportedCandidate = false;
+  while (millis() - t0 < timeoutMs) {
+    setKey(key);
+    (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+    (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+    const float v = getAdcVoltage(getAdcUnscaled(key));
+    const float swing = fabsf(v - baseline);
+    if (swing > out.maxSwing) out.maxSwing = swing;
+    if (swing > thr) {
+      // Yellow = candidate press detected
+      setColor(key, 255, 255, 0);
+      updateAllLEDs();
+      hit++;
+      out.hits++;
+      if (!reportedCandidate) {
+        reportedCandidate = true;
+        out.pol = (v >= baseline) ? 1 : -1;
+        if (_outputFormat) {
+          beginJson("testb_hit");
+          printJsonKV("key", key);
+          printJsonKV("v", v);
+          printJsonKV("swing", swing);
+          printJsonKV("thr", thr);
+          printJsonKV("pol", out.pol);
+          printJsonKV("ms", (int)(millis() - t0), true);
+          endJson();
+        }
+      }
+      if (hit >= consecutive) return true;
+    } else {
+      // Back to white while waiting
+      setColor(key, 255, 255, 255);
+      updateAllLEDs();
+      hit = 0;
+    }
+    delay(2);
+  }
+  return false;
+}
+
+void handleTest1(float* params, int count)
+{
+  (void)params; (void)count;
+  diagBegin();
+  // Ensure full key range for this test so the board sentinel keys are not skipped
+  // due to a previously selected interval.
+  setKeyInterval(0, NUM_KEYS - 1);
+
+  // Start cue: two short blue flashes
+  for (int i = 0; i < 2; ++i) {
+    setColorAll(0, 0, 80);
+    updateAllLEDs();
+    delay(150);
+    setColorAll(0, 0, 0);
+    updateAllLEDs();
+    delay(150);
+  }
+  // Sentinel positions:
+  // Subtest 1: board 1 keys 1..16 (on-board mux sanity)
+  // Subtest 2: first key of boards 2..5 (board presence)
+  // Subtest 3: sparse spread on board 1 (17,33,49) as additional mux coverage
+  static int sentinels[16 + 4 + 3];
+  int nSentinels = 0;
+  // board 1: keys 1..16
+  for (int k = 0; k < 16; ++k) sentinels[nSentinels++] = k;
+  // board first keys (skip duplicate 0)
+  sentinels[nSentinels++] = 56;
+  sentinels[nSentinels++] = 112;
+  sentinels[nSentinels++] = 168;
+  sentinels[nSentinels++] = 224;
+  // board 1: keys 17,33,49 (0-based 16,32,48)
+  sentinels[nSentinels++] = 16;
+  sentinels[nSentinels++] = 32;
+  sentinels[nSentinels++] = 48;
+
+  if (_outputFormat) {
+    beginJson("testb");
+    printJsonKV("sentinels", nSentinels, true);
+    endJson();
+  } else {
+    _println("Test B (sentinel press). Instructions:");
+    _println("- For each lit key: keep hands off for ~0.5s, then press once firmly.");
+    _println("- White = press key now; Green = pass; Red = retry/fail.");
+    _println("- Timeout per key: 8 seconds.");
+  }
+
+  int passCount = 0;
+  int failCount = 0;
+  bool okAll = true;
+  for (int i = 0; i < nSentinels; ++i) {
+    const int key = sentinels[i];
+    if (key < 0 || key >= NUM_KEYS) continue;
+    // waitForPress() drives LEDs for baseline/press
+
+    int board, boardKey;
+    getBoardAndBoardKey(key, board, boardKey);
+
+    if (!_outputFormat) {
+      _println("Press sentinel key %d (board %d key %d)", key + 1, board + 1, boardKey + 1);
+    }
+
+    TestbResult res;
+    const bool ok = waitForPress(key, 8000, res);
+
+    if (_outputFormat) {
+      beginJson("testb_row");
+      printJsonKV("key", key);
+      printJsonKV("board", board);
+      printJsonKV("boardKey", boardKey);
+      printJsonKV("ok", ok ? 1 : 0);
+      printJsonKV("baseline", res.baseline);
+      printJsonKV("sigma", res.sigma);
+      printJsonKV("thr", res.thr);
+      printJsonKV("maxSwing", res.maxSwing);
+      printJsonKV("pol", res.pol);
+      printJsonKV("hits", res.hits, true);
+      endJson();
+    } else {
+      _println("testb row key=%d board=%d boardKey=%d ok=%d baseline=%.4f sigma=%.6f thr=%.4f maxSwing=%.4f hits=%d",
+               key + 1, board + 1, boardKey + 1, ok ? 1 : 0,
+               res.baseline, res.sigma, res.thr, res.maxSwing, res.hits);
+    }
+
+    if (!ok) { okAll = false; failCount++; } else { passCount++; }
+    setColor(key, ok ? 0 : 255, ok ? 255 : 0, 0);
+    updateAllLEDs();
+    delay(ok ? 250 : 500);
+  }
+
+  if (_outputFormat) {
+    beginJson("testb_done");
+    printJsonKV("passCount", passCount);
+    printJsonKV("failCount", failCount);
+    printJsonKV("total", passCount + failCount);
+    printJsonKV("pass", okAll ? 1 : 0, true);
+    endJson();
+  } else {
+    _println("testb %s", okAll ? "PASS" : "FAIL");
+    _println("testb summary pass=%d fail=%d total=%d", passCount, failCount, passCount + failCount);
+  }
+
+  // Finish animation: all keys blue, then restore
+  setColorAll(0, 0, 0);
+  updateAllLEDs();
+  for (int i = 0; i < 3; ++i) {
+    setColorAll(0, 0, 80);
+    updateAllLEDs();
+    delay(200);
+    setColorAll(0, 0, 0);
+    updateAllLEDs();
+    delay(200);
+  }
+  setColorAll(0, 0, 80);
+  updateAllLEDs();
+  delay(800);
+
+  diagEnd();
+}
+
+void handleTest2(float* params, int count)
+{
+  // settle sweep uses sts; pick two sentinels by default
+  int keyA = 0;
+  int keyB = 56;
+  if (count >= 2) {
+    keyA = (int)params[0] - 1;
+    keyB = (int)params[1] - 1;
+  }
+  float p[2] = {(float)(keyA + 1), (float)(keyB + 1)};
+  handleSettleSweep(p, 2);
+}
+
+void handleTest3(float* params, int count)
+{
+  const int seconds = (count >= 1) ? max(1, (int)params[0]) : 2;
+  float p[1] = {(float)seconds};
+  handleProblemReport(p, 1);
+}
+
+void handleTest6(float* params, int count)
+{
+  mcpAck();
+  diagBegin();
+  (void)params; (void)count;
+  const int avgs[] = {1, 2, 4, 8, 16, 32};
+  const int ms = 1000;
+
+  if (_outputFormat) {
+    beginJson("t6");
+    printJsonKV("ms", ms);
+    printJsonKV("steps", (int)(sizeof(avgs)/sizeof(avgs[0])), true);
+    endJson();
+  } else {
+    _println("t6 perf sweep");
+    Serial.println("avg,keysPerSec,sigmaP95");
+  }
+
+  // Use noise sigma snapshot for p95 on the current range
+  for (int i = 0; i < (int)(sizeof(avgs)/sizeof(avgs[0])); ++i) {
+    _measureAvgStandard = avgs[i];
+    analogReadAveraging(_measureAvgStandard);
+
+    // rate
+    // capture rate into local by running an internal copy
+    const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD;
+    uint32_t steps = 0;
+    uint32_t reads = 0;
+    const uint32_t t0 = millis();
+    while (millis() - t0 < (uint32_t)ms) {
+      for (int muxPos = 0; muxPos < OFFSET; ++muxPos) {
+        setKey(muxPos);
+        const int keyA = muxPos;
+        const int keyB = muxPos + OFFSET;
+        if (keyA >= _fromKey && keyA <= _toKey) { (void)getAdcUnscaled(keyA); ++reads; }
+        if (keyB >= _fromKey && keyB <= _toKey) { (void)getAdcUnscaled(keyB); ++reads; }
+        ++steps;
+      }
+    }
+    const float secs = (float)ms / 1000.0f;
+    const float keysPerSec = (reads / secs);
+
+    // noise quick (200ms)
+    scanNoise(200);
+    // compute p95 sigma
+    static float tmp[NUM_KEYS];
+    int n = 0;
+    for (int k = _fromKey; k <= _toKey; ++k) tmp[n++] = _noiseUnscaled[k];
+    // partial sort for p95
+    const int idx = (int)(0.95f * (n - 1));
+    for (int a = 0; a <= idx; ++a) {
+      int best = a;
+      for (int b = a + 1; b < n; ++b) if (tmp[b] < tmp[best]) best = b;
+      float t = tmp[a]; tmp[a] = tmp[best]; tmp[best] = t;
+    }
+    const float sigmaP95 = tmp[idx];
+
+    if (_outputFormat) {
+      beginJson("t6_row");
+      printJsonKV("avg", _measureAvgStandard);
+      printJsonKV("keysPerSec", keysPerSec);
+      printJsonKV("sigmaP95", sigmaP95, true);
+      endJson();
+    } else {
+      Serial.print(_measureAvgStandard);
+      Serial.print(",");
+      Serial.print(keysPerSec, 1);
+      Serial.print(",");
+      Serial.println(sigmaP95, 6);
+    }
+  }
+
+  diagEnd();
 }
 
 void handleHelp(float* params, int count) {

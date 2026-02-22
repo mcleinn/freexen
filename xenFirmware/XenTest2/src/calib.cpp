@@ -4,29 +4,51 @@
 #include "utils.h"
 #include "mux.h"
 #include "adc.h"
-#include "dac.h"
 #include "sdcard.h"
 #include "led.h"
+#include "main.h"
 
 float _threshold_delta[NUM_KEYS];
 float _zeroVoltage[NUM_KEYS];
+bool _hasZero[NUM_KEYS];
 
 int _currentCalibrationKey = 0;
 int _calibLoopState = STATE_CALIBRATION_START;
-int _gain[NUM_KEYS];
-int _offset[NUM_KEYS];
 float _maxSwing[NUM_KEYS];
 short _polarization[NUM_KEYS];
 bool _manualCalibration = false;
 float _noiseUnscaled[NUM_KEYS];
-float _noiseScaled[NUM_KEYS];
 
-int _measureAvgStandard = 32;
+bool _calibAutoLoadOk = false;
+bool _bootedInDebugMode = false;
+bool _calibDirty = false;
+
+// Calibration bookkeeping (skips/fails)
+static bool _calibSkipped[NUM_KEYS];
+static bool _calibFailed[NUM_KEYS];
+static uint32_t _calibWaitOnStartMs = 0;
+static bool _calibSelfTriggering[NUM_KEYS];
+static bool _calibNotReleasing[NUM_KEYS];
+static bool _calibSlightlyStuck[NUM_KEYS];
+
+// Per-key state timers (avoid static carry-over between keys)
+static uint32_t _calibHoldStartMs = 0;
+static uint32_t _calibOnStartMs = 0;
+
+// Enforce initial/between-key settling before baseline capture
+static bool _calibNeedSettle = false;
+static uint32_t _calibSettleStartMs = 0;
+
+volatile uint32_t _scanPasses = 0;
+volatile uint32_t _scanKeyReads = 0;
+
+int _measureAvgStandard = 4;
 int _measureAvgCalibration = 32;
 
 void setupCalibration() {
    if (_debugMode) return;
    bool ok = !_manualCalibration && loadCalibrationCSV();
+   _calibAutoLoadOk = ok;
    _manualCalibration = false;
    
    if (!ok) {    
@@ -53,13 +75,14 @@ bool readKeyForCalibration() {
 }
 
 static inline void scanKey(int key)
-{   // do not forget to set DAC and dPot for this key before
-    const int  adc = getAdcMain(key);
+{
+    const int  adc = getAdcUnscaled(key);
     const float v  = getAdcVoltage(adc);
     peakDetect(v, key);
 }
 
 void scanKeysNormal() {
+  if (_diagActive) return;
   while (usbMIDI.read()) {};
 
   const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD; // 3 * 56 in our case
@@ -75,29 +98,26 @@ void scanKeysNormal() {
       if (!doA && !doB)                   // nothing to do for this MUX address
           continue;
     
-      if (doA)
-        setDacMain(keyA, _offset[keyA]);
-      if (doB)
-        setDacMain(keyB, _offset[keyB]);
-
       setKey(muxPos);                     // one change of the analogue multiplexer
-      delayMicroseconds(_us_delay_after_dac_set - _us_delay_after_mux);
+      delayMicroseconds(_us_delay_after_mux);
 
-      if (doA) scanKey(keyA);
-      if (doB) scanKey(keyB);
+      // Discard-first-sample strategy to reduce carryover/ADC sample cap artifacts.
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+
+      if (doA) { scanKey(keyA); ++_scanKeyReads; }
+      if (doB) { scanKey(keyB); ++_scanKeyReads; }
   }
+
+  ++_scanPasses;
 }
 
 void scanNoise(int ms) {    
     // --- per-key running statistics (Welford) -------------------------------
-    static float meanScaled  [NUM_KEYS];
-    static float m2Scaled    [NUM_KEYS];
     static float meanUnscaled[NUM_KEYS];
     static float m2Unscaled  [NUM_KEYS];
     static uint32_t n[NUM_KEYS];
 
-    memset(meanScaled,   0, sizeof(meanScaled));
-    memset(m2Scaled,     0, sizeof(m2Scaled));
     memset(meanUnscaled, 0, sizeof(meanUnscaled));
     memset(m2Unscaled,   0, sizeof(m2Unscaled));
     memset(n,            0, sizeof(n));
@@ -117,27 +137,20 @@ void scanNoise(int ms) {
             const bool doB = (keyB >= _fromKey) && (keyB <= _toKey);
             if (!doA && !doB) continue;
 
-            if (doA) setDacMain(keyA, _offset[keyA]);
-            if (doB) setDacMain(keyB, _offset[keyB]);
-
             setKey(muxPos);
-            delayMicroseconds(_us_delay_after_dac_set - _us_delay_after_mux);
+            delayMicroseconds(_us_delay_after_mux);
+
+            (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+            (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
 
             // ------------------------------- sample A ----------------------
             if (doA)
             {
-                const float vMain = getAdcVoltage(getAdcMain(keyA));
                 const float vRaw  = getAdcVoltage(getAdcUnscaled(keyA));
 
                 ++n[keyA];
 
-                // --- Main path (scaled) ---
-                float delta = vMain - meanScaled[keyA];
-                meanScaled[keyA] += delta / n[keyA];
-                m2Scaled[keyA]   += delta * (vMain - meanScaled[keyA]);
-
-                // --- Raw path (unscaled) ---
-                delta = vRaw - meanUnscaled[keyA];
+                float delta = vRaw - meanUnscaled[keyA];
                 meanUnscaled[keyA] += delta / n[keyA];
                 m2Unscaled[keyA]   += delta * (vRaw - meanUnscaled[keyA]);
             }
@@ -145,16 +158,11 @@ void scanNoise(int ms) {
             // ------------------------------- sample B ----------------------
             if (doB)
             {
-                const float vMain = getAdcVoltage(getAdcMain(keyB));
                 const float vRaw  = getAdcVoltage(getAdcUnscaled(keyB));
 
                 ++n[keyB];
 
-                float delta = vMain - meanScaled[keyB];
-                meanScaled[keyB] += delta / n[keyB];
-                m2Scaled[keyB]   += delta * (vMain - meanScaled[keyB]);
-
-                delta = vRaw - meanUnscaled[keyB];
+                float delta = vRaw - meanUnscaled[keyB];
                 meanUnscaled[keyB] += delta / n[keyB];
                 m2Unscaled[keyB]   += delta * (vRaw - meanUnscaled[keyB]);
             }
@@ -165,10 +173,8 @@ void scanNoise(int ms) {
     for (int k = 0; k < NUM_KEYS; ++k)
     {
         if (n[k] > 1) {
-            _noiseScaled[k]   = sqrtf(m2Scaled[k]   / (n[k] - 1));  // σMAIN
             _noiseUnscaled[k] = sqrtf(m2Unscaled[k] / (n[k] - 1));  // σRAW
         } else {
-            _noiseScaled[k]   = 0.0f;
             _noiseUnscaled[k] = 0.0f;
         }
     }
@@ -183,28 +189,21 @@ void printNoiseLevels()
         const int first = s * NUM_KEYS_PER_BOARD;
         const int last  = min(first + NUM_KEYS_PER_BOARD, NUM_KEYS) - 1;
 
-        float maxScaled   = 0.0f, maxUnscaled   = 0.0f;
-        float sumScaled   = 0.0f, sumUnscaled   = 0.0f;
-        int   cntScaled   = 0   , cntUnscaled   = 0   ;
+        float maxUnscaled = 0.0f;
+        float sumUnscaled = 0.0f;
+        int   cntUnscaled = 0;
 
         for (int k = first; k <= last; ++k)
         {
-            const float ns = _noiseScaled[k];
             const float nu = _noiseUnscaled[k];
-
-            if (ns > maxScaled)   maxScaled   = ns;
             if (nu > maxUnscaled) maxUnscaled = nu;
-
-            if (ns > 0.0f) { sumScaled   += ns; ++cntScaled;   }
             if (nu > 0.0f) { sumUnscaled += nu; ++cntUnscaled; }
         }
 
-        const float avgScaled   = cntScaled   ? sumScaled   / cntScaled   : 0.0f;
         const float avgUnscaled = cntUnscaled ? sumUnscaled / cntUnscaled : 0.0f;
 
-        _println("Keys %3d-%3d  |  Main σ ≤ %.6f  (σ̄ = %.6f)  |  Unscaled σ ≤ %.6f  (σ̄ = %.6f)",
+        _println("Keys %3d-%3d  |  Unscaled σ ≤ %.6f  (σ̄ = %.6f)",
                  first + 1, last + 1,
-                 maxScaled,   avgScaled,
                  maxUnscaled, avgUnscaled);
     }
 }
@@ -238,12 +237,10 @@ void hsvToRgb(float h, float s, float v,
 
 //---------------------------------------------------------------------------
 //  Paint the strip with a blue-to-red gradient representing noise level.
-//      adc == 0  → σ measured on the *Main* path  (_noiseScaled)
-//      adc == 1  → σ measured on the *Unscaled* path  (_noiseUnscaled)
 //---------------------------------------------------------------------------
-void showNoise(int adc)
+void showNoise(int)
 {
-    const float *noise = (adc == 0) ? _noiseScaled : _noiseUnscaled;
+    const float *noise = _noiseUnscaled;
 
     // ----- find span (min / max) so we can normalise to 0‒1 -------------
     float nMin = noise[0], nMax = noise[0];
@@ -274,12 +271,6 @@ void showNoise(int adc)
 }
 
 void printCalibration(int key) {
-    _println("[%d] Offset=%d (%f V), Gain=%d", 
-        key+1, 
-        _offset[key], 
-        getAdcVoltage(_offset[key]),
-        _gain[key] 
-        );
     _println("[%d] MaxSwing=%f V, Pol=%d",
         key+1, 
         _maxSwing[key], 
@@ -288,16 +279,26 @@ void printCalibration(int key) {
     _println("[%d] Threshold=%f V", key+1, _threshold_delta[key]);
 }
 
-void setOffset(int key, int offset) {
-    _offset[key] = offset;
-}
-
-void setGain(int key, int gain) {
-    _gain[key] = gain;
-}
-
 void setThreshold(int key, float threshold) {
     _threshold_delta[key]= threshold;
+}
+
+void clearCalibration(int fromKey, int toKey)
+{
+    if (fromKey < 0) fromKey = 0;
+    if (toKey >= NUM_KEYS) toKey = NUM_KEYS - 1;
+    if (toKey < fromKey) return;
+
+    for (int k = fromKey; k <= toKey; ++k) {
+        _hasZero[k] = false;
+        _zeroVoltage[k] = 0.0f;
+        _threshold_delta[k] = 0.0f;
+        _maxSwing[k] = 0.0f;
+        _polarization[k] = 0;
+        _noiseUnscaled[k] = 0.0f;
+    }
+
+    _calibDirty = true;
 }
 
 void loopCalibrationStart() {
@@ -310,63 +311,319 @@ void loopCalibrationStart() {
       _calibLoopState = STATE_RUNNING;
       return;
     }
+
+    // Clean slate only for selected range.
+    clearCalibration(_fromKey, _toKey);
+    for (int k = _fromKey; k <= _toKey; ++k) {
+      _calibSkipped[k] = false;
+      _calibFailed[k] = false;
+      _calibSelfTriggering[k] = false;
+      _calibNotReleasing[k] = false;
+      _calibSlightlyStuck[k] = false;
+    }
+
+    _calibHoldStartMs = 0;
+    _calibOnStartMs = 0;
+
     _currentCalibrationKey = _fromKey;
+    _calibNeedSettle = true;
+    _calibSettleStartMs = millis();
     _calibLoopState = STATE_CALIBRATION_OFF;
+
+    if (_outputFormat) {
+      Serial.print("{\"type\":\"calib_start\",\"from\":");
+      Serial.print(_fromKey);
+      Serial.print(",\"to\":");
+      Serial.print(_toKey);
+      Serial.println("}");
+    }
 }
   
 void loopCalibrationOff() {
     setKey(_currentCalibrationKey);
-    delay(10);
-  
     analogReadAveraging(_measureAvgCalibration);
-  
-    setDacMain(_currentCalibrationKey, 0); // set zeroPoint to center
-    delayMicroseconds(_us_delay_after_dac_zero);
-  
-    int unscaledValue = getAdcUnscaled(_currentCalibrationKey);
-    float unscaledVoltage = getAdcVoltage(unscaledValue);
-  
-    int dacValue = 0;
-    float closestError = 0;
-    calibrationSweep(dacValue, closestError, _currentCalibrationKey, unscaledVoltage);
-    setDacMain(_currentCalibrationKey, dacValue);
-  
-    //int dacValue = getDacValue(unscaledVoltage);
-    //_println("DACValue %d", dacValue);
-    //mainDAC(2020, 0); // set zeroPoint to center
-    delayMicroseconds(_us_delay_after_dac_set);
-  
-    int scaledValue = getAdcMain(_currentCalibrationKey);
-    float scaledVoltage = getAdcVoltage(scaledValue);
-  
-    _println("[%d] Unscaled zero: %d %f V, scaled zero: %d %f V", _currentCalibrationKey+1, unscaledValue, unscaledVoltage, scaledValue, scaledVoltage);
-  
-    _zeroVoltage[_currentCalibrationKey] = scaledVoltage;
-    _offset[_currentCalibrationKey] = dacValue;
-    //_println("3, calibration Key %d", _currentCalibrationKey);
-  
-    LEDStrip->setPixelColor(_currentCalibrationKey, 0, 255, 0);
-  
+
+    // Match testb algorithm and logging as closely as possible.
+    const float thresholdMin = 0.03f;
+    const float kSigma = 8.0f;
+    const uint32_t baseMs = 400;
+    const uint32_t settleMs = 200;
+    const int baselineRetries = 3;
+
+    // Settling gate to ensure "clean slate" sampling after mux switch and key changes.
+    if (_calibNeedSettle) {
+      setColorAll(0, 0, 0);
+      setColor(_currentCalibrationKey, 0, 0, 255);
+      updateAllLEDs();
+
+      if (millis() - _calibSettleStartMs < settleMs) {
+        (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+        (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+        delay(5);
+        return;
+      }
+      _calibNeedSettle = false;
+    }
+
+    // LED: blue = baseline (hands off)
+    setColorAll(0, 0, 0);
+    setColor(_currentCalibrationKey, 0, 0, 255);
+    updateAllLEDs();
+
+    float sigma = 0.0f;
+    float baseline = 0.0f;
+    float thr = thresholdMin;
+    float vMin =  0.0f;
+    float vMax =  0.0f;
+    float baseSwingMax = 0.0f;
+    bool okBaseline = false;
+
+    for (int attempt = 0; attempt < baselineRetries; ++attempt) {
+      // Discard-first-sample after mux switch to reduce carryover/settling artifacts.
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+      (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+
+      const uint32_t t0 = millis();
+      uint32_t n = 0;
+      float mean = 0.0f;
+      float m2 = 0.0f;
+      vMin =  1e9f;
+      vMax = -1e9f;
+      while (millis() - t0 < baseMs) {
+          const float v = getAdcVoltage(getAdcUnscaled(_currentCalibrationKey));
+          if (v < vMin) vMin = v;
+          if (v > vMax) vMax = v;
+          ++n;
+          const float delta = v - mean;
+          mean += delta / n;
+          m2   += delta * (v - mean);
+          delay(2);
+      }
+
+      sigma = (n > 1) ? sqrtf(m2 / (n - 1)) : 0.0f;
+      baseline = mean;
+      thr = max(thresholdMin, kSigma * sigma);
+      baseSwingMax = max(fabsf(vMax - baseline), fabsf(vMin - baseline));
+
+      if (baseSwingMax <= thr) {
+        okBaseline = true;
+        break;
+      }
+
+      // Retry after a short settle.
+      delay(50);
+    }
+
+    if (!okBaseline) {
+        _calibSelfTriggering[_currentCalibrationKey] = true;
+        if (_outputFormat) {
+          int board, boardKey;
+          getBoardAndBoardKey(_currentCalibrationKey, board, boardKey);
+          Serial.print("{\"type\":\"calib_row\",\"key\":");
+          Serial.print(_currentCalibrationKey);
+          Serial.print(",\"board\":");
+          Serial.print(board);
+          Serial.print(",\"boardKey\":");
+          Serial.print(boardKey);
+          Serial.print(",\"ok\":0,\"reason\":\"SelfTriggering\",");
+          Serial.print("\"baseline\":");
+          Serial.print(baseline, 6);
+          Serial.print(",\"sigma\":");
+          Serial.print(sigma, 6);
+          Serial.print(",\"thr\":");
+          Serial.print(thr, 6);
+          Serial.print(",\"baseSwingMax\":");
+          Serial.print(baseSwingMax, 6);
+          Serial.println("}");
+        } else {
+          _println("calib SelfTriggering key=%d baseSwingMax=%.4f thr=%.4f", _currentCalibrationKey + 1, baseSwingMax, thr);
+        }
+
+        // LED: orange blink then advance
+        setColor(_currentCalibrationKey, 255, 100, 0);
+        updateAllLEDs();
+        delay(200);
+        setColor(_currentCalibrationKey, 0, 0, 0);
+        updateAllLEDs();
+
+        if (_currentCalibrationKey < _toKey) {
+            _currentCalibrationKey++;
+            _calibNeedSettle = true;
+            _calibSettleStartMs = millis();
+            _calibLoopState = STATE_CALIBRATION_OFF;
+        } else {
+            _calibLoopState = STATE_CALIBRATION_STOP;
+        }
+        return;
+    }
+
+    _threshold_delta[_currentCalibrationKey] = thr;
+    _zeroVoltage[_currentCalibrationKey] = baseline;
+    // Only mark the key as calibrated after a successful press+release.
+    _hasZero[_currentCalibrationKey] = false;
+    _maxSwing[_currentCalibrationKey] = 0.0f;
+    _polarization[_currentCalibrationKey] = 0;
+    _noiseUnscaled[_currentCalibrationKey] = sigma;
+
+    _calibDirty = true;
+
+    // Emit testb-style baseline log line too (calibration is a superset).
+    if (_outputFormat) {
+      Serial.print("{\"type\":\"testb\",\"key\":");
+      Serial.print(_currentCalibrationKey);
+      Serial.print(",\"baseline\":");
+      Serial.print(baseline, 6);
+      Serial.print(",\"sigma\":");
+      Serial.print(sigma, 6);
+      Serial.print(",\"thr\":");
+      Serial.print(thr, 6);
+      Serial.print(",\"min\":");
+      Serial.print(vMin, 6);
+      Serial.print(",\"max\":");
+      Serial.print(vMax, 6);
+      Serial.println("}");
+    } else {
+      _println("testb key=%d baseline=%.4fV sigma=%.6f thr=%.4fV (min=%.4f max=%.4f)",
+               _currentCalibrationKey + 1, baseline, sigma, thr, vMin, vMax);
+    }
+
+    if (_outputFormat) {
+      Serial.print("{\"type\":\"calib_base\",\"key\":");
+      Serial.print(_currentCalibrationKey);
+      Serial.print(",\"baseline\":");
+      Serial.print(baseline, 6);
+      Serial.print(",\"sigma\":");
+      Serial.print(sigma, 6);
+      Serial.print(",\"thr\":");
+      Serial.print(thr, 6);
+      Serial.print(",\"min\":");
+      Serial.print(vMin, 6);
+      Serial.print(",\"max\":");
+      Serial.print(vMax, 6);
+      Serial.println("}");
+    } else {
+      _println("calib_base key=%d baseline=%.4f sigma=%.6f thr=%.4f min=%.4f max=%.4f",
+               _currentCalibrationKey + 1, baseline, sigma, thr, vMin, vMax);
+    }
+
+    // LED: white = press now
+    setColor(_currentCalibrationKey, 255, 255, 255);
+    updateAllLEDs();
+
+    _calibWaitOnStartMs = millis();
+    _calibHoldStartMs = 0;
+    _calibOnStartMs = 0;
+
     _calibLoopState = STATE_CALIBRATION_WAIT_ON;
   }
   
-  void loopCalibrationWaitOn() {
-    int currentValue = getAdcMain(_currentCalibrationKey);
-    float currentVoltage = getAdcVoltage(currentValue); 
+void loopCalibrationWaitOn() {
+    // Skip gesture: hold the current key (swing > threshold) continuously for >2 seconds.
+    const uint32_t skipHoldMs = 2000;
+    // (no static timers; per-session globals)
+
+    int currentValue = getAdcUnscaled(_currentCalibrationKey);
+    float currentVoltage = getAdcVoltage(currentValue);
     float swing = fabs(currentVoltage - _zeroVoltage[_currentCalibrationKey]);
+
+    // If no press detected for a long time, mark as failed and advance.
+    if (millis() - _calibWaitOnStartMs > 8000) {
+        _calibFailed[_currentCalibrationKey] = true;
+        if (_outputFormat) {
+          int board, boardKey;
+          getBoardAndBoardKey(_currentCalibrationKey, board, boardKey);
+          Serial.print("{\"type\":\"calib_row\",\"key\":");
+          Serial.print(_currentCalibrationKey);
+          Serial.print(",\"board\":");
+          Serial.print(board);
+          Serial.print(",\"boardKey\":");
+          Serial.print(boardKey);
+           Serial.print(",\"ok\":0,\"reason\":\"NotTriggering\"}");
+           Serial.println();
+        }
+
+        // LED: red flash then advance
+        setColor(_currentCalibrationKey, 255, 0, 0);
+        updateAllLEDs();
+        delay(200);
+        setColor(_currentCalibrationKey, 0, 0, 0);
+        updateAllLEDs();
+
+        if (_currentCalibrationKey < _toKey) {
+            _currentCalibrationKey++;
+            _calibLoopState = STATE_CALIBRATION_OFF;
+        } else {
+            _calibLoopState = STATE_CALIBRATION_STOP;
+        }
+        return;
+    }
   
     if (swing > _threshold_delta[_currentCalibrationKey]) {
-        LEDStrip->setPixelColor(_currentCalibrationKey, 255, 255, 255);
+        // If user keeps holding beyond skipHoldMs, treat it as "skip".
+        if (_calibHoldStartMs == 0) _calibHoldStartMs = millis();
+        if (millis() - _calibHoldStartMs > skipHoldMs) {
+            _calibSkipped[_currentCalibrationKey] = true;
+            _calibHoldStartMs = 0;
+
+            if (_outputFormat) {
+              int board, boardKey;
+              getBoardAndBoardKey(_currentCalibrationKey, board, boardKey);
+              Serial.print("{\"type\":\"calib_row\",\"key\":");
+              Serial.print(_currentCalibrationKey);
+              Serial.print(",\"board\":");
+              Serial.print(board);
+              Serial.print(",\"boardKey\":");
+              Serial.print(boardKey);
+              Serial.print(",\"ok\":0,\"reason\":\"skipped\"}");
+              Serial.println();
+            }
+
+            // LED: purple blink for skip
+            setColor(_currentCalibrationKey, 180, 0, 180);
+            updateAllLEDs();
+            delay(200);
+            setColor(_currentCalibrationKey, 0, 0, 0);
+            updateAllLEDs();
+
+            if (_currentCalibrationKey < _toKey) {
+                _currentCalibrationKey++;
+                _calibNeedSettle = true;
+                _calibSettleStartMs = millis();
+                _calibLoopState = STATE_CALIBRATION_OFF;
+            } else {
+                _calibLoopState = STATE_CALIBRATION_STOP;
+            }
+            return;
+        }
+
+        // LED: yellow = candidate press
+        setColor(_currentCalibrationKey, 255, 255, 0);
+        updateAllLEDs();
         _maxSwing[_currentCalibrationKey] = swing;
 
-        _println("[%d] Over threshold: %f V Swing: %f V", _currentCalibrationKey+1, currentVoltage, swing);
+        if (_outputFormat) {
+          Serial.print("{\"type\":\"calib_hit\",\"key\":");
+          Serial.print(_currentCalibrationKey);
+          Serial.print(",\"v\":");
+          Serial.print(currentVoltage, 6);
+          Serial.print(",\"swing\":");
+          Serial.print(swing, 6);
+          Serial.print(",\"thr\":");
+          Serial.print(_threshold_delta[_currentCalibrationKey], 6);
+          Serial.println("}");
+        } else {
+          _println("calib_hit key=%d v=%.4f swing=%.4f thr=%.4f", _currentCalibrationKey+1, currentVoltage, swing, _threshold_delta[_currentCalibrationKey]);
+        }
         _calibLoopState = STATE_CALIBRATION_ON;
+    } else {
+        // reset hold timer if below threshold
+        _calibHoldStartMs = 0;
     }
   }
   
-  void loopCalibrationOn() {
-    int currentValue = getAdcMain(_currentCalibrationKey);
-    float currentVoltage = getAdcVoltage(currentValue); 
+void loopCalibrationOn() {
+    int currentValue = getAdcUnscaled(_currentCalibrationKey);
+    float currentVoltage = getAdcVoltage(currentValue);
     float swing = fabs(currentVoltage - _zeroVoltage[_currentCalibrationKey]);
   
     if (swing > _maxSwing[_currentCalibrationKey])
@@ -374,72 +631,182 @@ void loopCalibrationOff() {
   
     _polarization[_currentCalibrationKey] = currentVoltage > _zeroVoltage[_currentCalibrationKey] ? 1 : -1;
   
+    // Not releasing detection: if user never returns under threshold within a limit, mark and advance.
+    // Also track "slightly stuck" if release takes >2s (still succeeds).
+    if (_calibOnStartMs == 0) _calibOnStartMs = millis();
+    const uint32_t slightlyStuckMs = 2000;
+    const uint32_t notReleasingMs = 6000;
+    if (millis() - _calibOnStartMs > notReleasingMs) {
+        _calibNotReleasing[_currentCalibrationKey] = true;
+        if (_outputFormat) {
+          int board, boardKey;
+          getBoardAndBoardKey(_currentCalibrationKey, board, boardKey);
+          Serial.print("{\"type\":\"calib_row\",\"key\":");
+          Serial.print(_currentCalibrationKey);
+          Serial.print(",\"board\":");
+          Serial.print(board);
+          Serial.print(",\"boardKey\":");
+          Serial.print(boardKey);
+          Serial.print(",\"ok\":0,\"reason\":\"NotReleasing\",");
+          Serial.print("\"maxSwing\":");
+          Serial.print(_maxSwing[_currentCalibrationKey], 6);
+          Serial.print(",\"pol\":");
+          Serial.print((int)_polarization[_currentCalibrationKey]);
+          Serial.println("}");
+        } else {
+          _println("calib NotReleasing key=%d maxSwing=%.4f", _currentCalibrationKey + 1, _maxSwing[_currentCalibrationKey]);
+        }
+
+        setColor(_currentCalibrationKey, 255, 0, 0);
+        updateAllLEDs();
+        delay(250);
+        setColor(_currentCalibrationKey, 0, 0, 0);
+        updateAllLEDs();
+
+        _calibOnStartMs = 0;
+        if (_currentCalibrationKey < _toKey) {
+            _currentCalibrationKey++;
+            _calibNeedSettle = true;
+            _calibSettleStartMs = millis();
+            _calibLoopState = STATE_CALIBRATION_OFF;
+        } else {
+            _calibLoopState = STATE_CALIBRATION_STOP;
+        }
+        return;
+    }
+
     if (swing < _threshold_delta[_currentCalibrationKey]) {
+        const uint32_t releaseMs = millis() - _calibOnStartMs;
+        if (releaseMs > slightlyStuckMs) {
+          _calibSlightlyStuck[_currentCalibrationKey] = true;
+        }
+
+        // Successful calibration for this key.
+        _hasZero[_currentCalibrationKey] = true;
         float percentageFull = swing / MAX_VOLTAGE * 100;
         _println("[%d] Under threshold: %f V. Max swing: %f V (%f \%) Polarization: %d", 
             _currentCalibrationKey+1, 
-            currentVoltage, 
-            _maxSwing[_currentCalibrationKey], 
+            currentVoltage,
+            _maxSwing[_currentCalibrationKey],
             percentageFull,
             _polarization[_currentCalibrationKey]);
 
-        LEDStrip->setPixelColor(_currentCalibrationKey, 0, 0, 0);
+        // Emit per-key row immediately
+        if (_outputFormat) {
+          int board, boardKey;
+          getBoardAndBoardKey(_currentCalibrationKey, board, boardKey);
+          Serial.print("{\"type\":\"calib_row\",\"key\":");
+          Serial.print(_currentCalibrationKey);
+          Serial.print(",\"board\":");
+          Serial.print(board);
+          Serial.print(",\"boardKey\":");
+          Serial.print(boardKey);
+          Serial.print(",\"ok\":1");
+          Serial.print(",\"baseline\":");
+          Serial.print(_zeroVoltage[_currentCalibrationKey], 6);
+          Serial.print(",\"sigma\":");
+          Serial.print(_noiseUnscaled[_currentCalibrationKey], 6);
+          Serial.print(",\"thr\":");
+          Serial.print(_threshold_delta[_currentCalibrationKey], 6);
+          Serial.print(",\"maxSwing\":");
+          Serial.print(_maxSwing[_currentCalibrationKey], 6);
+          Serial.print(",\"pol\":");
+          Serial.print((int)_polarization[_currentCalibrationKey]);
+          Serial.print(",\"releaseMs\":");
+          Serial.print(releaseMs);
+          Serial.print(",\"slightlyStuck\":");
+          Serial.print(releaseMs > slightlyStuckMs ? 1 : 0);
+          Serial.println("}");
+        }
+
+        // LED: green = stored
+        setColor(_currentCalibrationKey, 0, 255, 0);
+        updateAllLEDs();
+        delay(150);
+        setColor(_currentCalibrationKey, 0, 0, 0);
+        updateAllLEDs();
+        _calibOnStartMs = 0;
         if (_currentCalibrationKey < _toKey) {
             _currentCalibrationKey++;
+            _calibNeedSettle = true;
+            _calibSettleStartMs = millis();
             _calibLoopState = STATE_CALIBRATION_OFF;
         } else
             _calibLoopState = STATE_CALIBRATION_STOP;
     }
   }
   
-  void loopCalibrationStop() {
+void loopCalibrationStop() {
     analogReadAveraging(_measureAvgStandard);
     saveCalibrationCSV();
+    _calibDirty = false;
     updateAllLEDs();
+
+    if (_outputFormat) {
+      Serial.println("{\"type\":\"calib_saved\",\"file\":\"calib.csv\",\"ok\":1}");
+
+      // Summarize issues for the selected range
+      int skipped = 0;
+      int notTriggering = 0;
+      int selfTriggering = 0;
+      int notReleasing = 0;
+      for (int k = _fromKey; k <= _toKey; ++k) {
+        if (_calibSkipped[k]) skipped++;
+        if (_calibFailed[k]) notTriggering++;
+        if (_calibSelfTriggering[k]) selfTriggering++;
+        if (_calibNotReleasing[k]) notReleasing++;
+      }
+      Serial.print("{\"type\":\"calib_done\",\"Skipped\":");
+      Serial.print(skipped);
+      Serial.print(",\"NotTriggering\":");
+      Serial.print(notTriggering);
+      Serial.print(",\"SelfTriggering\":");
+      Serial.print(selfTriggering);
+      Serial.print(",\"NotReleasing\":");
+      Serial.print(notReleasing);
+      Serial.println("}");
+
+      for (int k = _fromKey; k <= _toKey; ++k) {
+        if (!_calibSkipped[k] && !_calibFailed[k] && !_calibSelfTriggering[k] && !_calibNotReleasing[k]) continue;
+        int board, boardKey;
+        getBoardAndBoardKey(k, board, boardKey);
+        Serial.print("{\"type\":\"calib_issue\",\"key\":");
+        Serial.print(k);
+        Serial.print(",\"board\":");
+        Serial.print(board);
+        Serial.print(",\"boardKey\":");
+        Serial.print(boardKey);
+        Serial.print(",\"reason\":\"");
+        if (_calibSelfTriggering[k]) Serial.print("SelfTriggering");
+        else if (_calibNotReleasing[k]) Serial.print("NotReleasing");
+        else if (_calibFailed[k]) Serial.print("NotTriggering");
+        else Serial.print("Skipped");
+        Serial.println("\"}");
+      }
+    } else {
+      int skipped = 0;
+      int notTriggering = 0;
+      int selfTriggering = 0;
+      int notReleasing = 0;
+      for (int k = _fromKey; k <= _toKey; ++k) {
+        if (_calibSkipped[k]) skipped++;
+        if (_calibFailed[k]) notTriggering++;
+        if (_calibSelfTriggering[k]) selfTriggering++;
+        if (_calibNotReleasing[k]) notReleasing++;
+      }
+      _println("calib done Skipped=%d NotTriggering=%d SelfTriggering=%d NotReleasing=%d", skipped, notTriggering, selfTriggering, notReleasing);
+      for (int k = _fromKey; k <= _toKey; ++k) {
+        if (!_calibSkipped[k] && !_calibFailed[k] && !_calibSelfTriggering[k] && !_calibNotReleasing[k]) continue;
+        int board, boardKey;
+        getBoardAndBoardKey(k, board, boardKey);
+        const char *reason = _calibSelfTriggering[k] ? "SelfTriggering" : (_calibNotReleasing[k] ? "NotReleasing" : (_calibFailed[k] ? "NotTriggering" : "Skipped"));
+        _println("calib issue key=%d board=%d keyOnBoard=%d reason=%s", k + 1, board + 1, boardKey + 1, reason);
+      }
+    }
   
     _calibLoopState = STATE_RUNNING;
   }
   
-  void calibrationSweep(int& bestDacValue, float& closestError, int key, float targetVoltage) {
-    int windowSize = 4095; // Initial window size is the full DAC range
-    int steps = 16;        // Fixed number of steps in each cycle
-    bestDacValue = 0;
-  
-    do { // Continue until the window is very small
-      int startDacValue = max(1000, bestDacValue - windowSize);
-      int endDacValue = min(3000, bestDacValue + windowSize);
-      closestError = 1e6; // Reset the closest error for this cycle
-      
-      for (int i = 0; i <= steps; i++) {
-        int dacValue = startDacValue + i * (endDacValue - startDacValue) / steps;
-        if (dacValue > DAC_RESOLUTION_MAX) break; // Avoid exceeding DAC limits
-  
-        setDacMain(key, dacValue);
-  
-        float dacVoltage = getDacVoltage(dacValue);
-        int adcValue = getAdcMain(key);
-        float adcVoltage = getAdcVoltage(adcValue);
-        float error = fabs(adcVoltage - targetVoltage);
-  
-        _println("DAC Value: %d, DAC Voltage: %.4f, ADC Value: %d, ADC Voltage: %.4f V, Error: %.4f",
-             dacValue, dacVoltage, adcValue, adcVoltage, error);
-  
-        if (error < closestError) {
-          closestError = error;
-          bestDacValue = dacValue;
-        }
-      } 
-  
-      _println("| Window: %d, Best DAC Value: %d, Closest Voltage: %.4f V, Closest Error: %.4f", 
-           windowSize, bestDacValue, getDacVoltage(bestDacValue), closestError);
-  
-      windowSize =  windowSize / 2; // Narrow the window size if results improve
-    } while (windowSize >= 1);
-  
-    Serial.print("X ");
-    Serial.println(bestDacValue);
-  }
-
   
 void saveCalibrationCSV() {
     char filename[255];
@@ -448,23 +815,22 @@ void saveCalibrationCSV() {
     SD.remove(filename);
     File configFile = SD.open(filename, FILE_WRITE);
     if (configFile) {
+        configFile.println("#calib_v3");
         Serial.println("Saving calibration to CSV...");
         for (int i = 0; i < NUM_KEYS; i++) {
           configFile.print(i);
           configFile.print(",");
-          configFile.print(_offset[i]);
-          configFile.print(",");
-          configFile.print(_gain[i]);
+          configFile.print(_hasZero[i] ? 1 : 0);
           configFile.print(",");
           configFile.print(_maxSwing[i]);          
           configFile.print(",");
           configFile.print(_polarization[i]);
           configFile.print(",");
-          configFile.print(_noiseScaled[i]);
+          configFile.print(_noiseUnscaled[i], 6);
           configFile.print(",");
-          configFile.println(_noiseUnscaled[i]);
+          configFile.print(_threshold_delta[i], 6);
           configFile.print(",");
-          configFile.println(_threshold_delta[i]);
+          configFile.println(_zeroVoltage[i], 6);
         }
         configFile.close();
         Serial.println("CSV calibration saved.");
@@ -474,6 +840,9 @@ void saveCalibrationCSV() {
 }
 
 bool loadCalibrationCSV() {
+    // Always start from a clean slate before applying persisted calibration.
+    clearCalibration(0, NUM_KEYS - 1);
+
     // Open "calib.csv" from the SD card
     File configFile = SD.open("calib.csv", FILE_READ);
     if (!configFile) {
@@ -483,12 +852,38 @@ bool loadCalibrationCSV() {
 
     Serial.println("Loading calibration from CSV...");
 
+    // Detect version / format. Treat unknown or old formats as "no calibration".
+    String firstLine;
+    while (configFile.available()) {
+        firstLine = configFile.readStringUntil('\n');
+        firstLine.trim();
+        if (firstLine.length() == 0) continue;
+        break;
+    }
+
+    const bool isV3 = firstLine.startsWith("#calib_v3");
+    if (!isV3) {
+        // Old format or unknown file; behave as if no calibration exists.
+        configFile.close();
+        clearCalibration(0, NUM_KEYS - 1);
+        Serial.println("Calibration file missing/old format. Starting uncalibrated.");
+        Serial.println("Select range with k<from>,<to> then run x to calibrate.");
+        return false;
+    }
+
+    // We'll mark clean only if we successfully parse at least one row.
+    bool any = false;
+
     // Read the file until no more lines
     while (configFile.available()) {
         String line = configFile.readStringUntil('\n');
         line.trim();  // Remove any trailing whitespace or newline
         if (line.length() == 0) {
             continue;  // Skip empty lines
+        }
+
+        if (line.startsWith("#")) {
+            continue; // skip comments/header
         }
 
         int lastPos = 0;
@@ -507,23 +902,17 @@ bool loadCalibrationCSV() {
             continue;
         }
 
-        // 2) _offset[key]
+        any = true;
+
+        // 2) hasZero
         nextPos = line.indexOf(',', lastPos);
         if (nextPos < 0) {
             continue;
         }
-        _offset[key] = line.substring(lastPos, nextPos).toInt();
+        const int hasZero = line.substring(lastPos, nextPos).toInt();
         lastPos = nextPos + 1;
 
-        // 3) _gain[key]
-        nextPos = line.indexOf(',', lastPos);
-        if (nextPos < 0) {
-            continue;
-        }
-        _gain[key] = line.substring(lastPos, nextPos).toFloat();
-        lastPos = nextPos + 1;
-
-        // 4) _maxSwing[key]
+        // Next: _maxSwing[key]
         nextPos = line.indexOf(',', lastPos);
         if (nextPos < 0) {
             continue;
@@ -531,24 +920,55 @@ bool loadCalibrationCSV() {
         _maxSwing[key] = line.substring(lastPos, nextPos).toFloat();
         lastPos = nextPos + 1;
 
-        // 5) _polarization[key]
-        // This is the last field, so just read the remainder of the line
-        _polarization[key] = line.substring(lastPos).toInt();
+        // 3) _polarization[key]
+        nextPos = line.indexOf(',', lastPos);
+        if (nextPos < 0) {
+            continue;
+        }
+        _polarization[key] = line.substring(lastPos, nextPos).toInt();
+        lastPos = nextPos + 1;
 
-        _threshold_delta[key] = key <= 267 ? 0.30f : 0.40f;
+        // 4) _noiseUnscaled[key]
+        nextPos = line.indexOf(',', lastPos);
+        if (nextPos < 0) {
+            continue;
+        }
+        _noiseUnscaled[key] = line.substring(lastPos, nextPos).toFloat();
+        lastPos = nextPos + 1;
 
-        // will be determined during bootup, when ADCs are read for the first time
-        _zeroVoltage[key] = 0;
+        // 5) _threshold_delta[key]
+        nextPos = line.indexOf(',', lastPos);
+        if (nextPos < 0) {
+            continue;
+        }
+        _threshold_delta[key] = line.substring(lastPos, nextPos).toFloat();
+        lastPos = nextPos + 1;
+
+        // 7) _zeroVoltage[key] (last field)
+        _zeroVoltage[key] = line.substring(lastPos).toFloat();
+
+        _hasZero[key] = (hasZero != 0);
+
+        // If the row is not calibrated, force all fields to defaults.
+        if (!_hasZero[key]) {
+          _zeroVoltage[key] = 0.0f;
+          _noiseUnscaled[key] = 0.0f;
+          _threshold_delta[key] = 0.0f;
+          _maxSwing[key] = 0.0f;
+          _polarization[key] = 0;
+        }
     }
 
     configFile.close();
     Serial.println("CSV calibration loaded.");
+    _calibDirty = !any ? true : false;
     return true;
 }
 
 
 // PEAK DETECT
 void peakDetect(float voltage, int key) {
+    if (_diagActive) return;
     int board, boardKey;
     // "static" variables keep their numbers between each run of this function
     static int state[NUM_KEYS];  // 0=idle, 1=looking for peak, 2=ignore aftershocks
@@ -556,11 +976,7 @@ void peakDetect(float voltage, int key) {
     static elapsedMillis msec[NUM_KEYS]; // timer to end states 1 and 2
     static bool playing[NUM_KEYS];
   
-    if (_zeroVoltage[key] == 0) {
-        _zeroVoltage[key] = voltage;
-  
-        _println("CAL [%d] Zero=%f V", key+1, _zeroVoltage[key]);
-    } 
+    if (!_hasZero[key]) return;
 
     float voltageSwing = fabs(_zeroVoltage[key] - voltage); 
     

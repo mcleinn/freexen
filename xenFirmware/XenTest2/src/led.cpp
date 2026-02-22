@@ -40,13 +40,12 @@ void updateAllLEDs() {
 
 void updateLEDs(int from, int to) {
   if (_numberLED == 0) return;
-  Serial.println("Updating LEDs...");
   // Turn the LED on, then pause
   for (int ledId = from; ledId <= to; ledId++) {
      if (ledId < 0 || ledId >= _numberLED) break;
      updateLED(ledId);
   }
-  Serial.println("LEDs updated.");
+  LEDStrip->show();
 }
 
 // board, key, led number -> unique ledId

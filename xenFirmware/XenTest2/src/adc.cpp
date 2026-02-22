@@ -11,14 +11,15 @@ void setupADC() {
     _println("ADC intialized, averaging %d.", _measureAvgStandard);
 }
 
-int getAdcMain(int key) {
-    short adc = key < (NUM_KEYS_PER_BOARD  * BOARDS_PER_ADC_CHANNEL) ? ADC_MAIN1 : ADC_MAIN2;
+int getAdcUnscaled(int key) {
+    const short adc = key < (NUM_KEYS_PER_BOARD  * BOARDS_PER_ADC_CHANNEL) ? ADC_UNSCALED1 : ADC_UNSCALED2;
     return analogRead(_adcPins[adc]);
 }
 
-int getAdcUnscaled(int key) {
-    short adc = key < (NUM_KEYS_PER_BOARD  * BOARDS_PER_ADC_CHANNEL) ? ADC_UNSCALED1 : ADC_UNSCALED2;
-    return analogRead(_adcPins[adc]);
+int getAdcUnscaledRawByIndex(int adcIndex)
+{
+    if (adcIndex < 0 || adcIndex >= NUM_ADCS) return 0;
+    return analogRead(_adcPins[adcIndex]);
 }
 
 float getAdcVoltage(int adcValue) {
