@@ -34,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 83;
+static const int XEN_FW_VERSION = 86;
 
 static inline void mcpAckRaw(const char* raw, const char* cmd, const char* desc)
 {
@@ -132,6 +132,12 @@ static float _autoOverMax = 0.0f;
 static int _autoOverMinKey = -1;
 static int _autoOverMaxKey = -1;
 static int _autoOverNonPositiveN = 0;
+static float _autoScansPerSec = 0.0f;
+static int _autoDynStepsMin = 0;
+static int _autoDynStepsMax = 0;
+static int _autoDynStepsMinKey = -1;
+static int _autoDynStepsMaxKey = -1;
+static int _autoDynStepsDeadN = 0;
 
 // Capture per-key info from the best candidate.
 static uint16_t _autoCountsBest[NUM_KEYS];
@@ -208,22 +214,59 @@ static int idleAuditCountsAndMax(int seconds, uint16_t* outCounts, float* outMax
   return total;
 }
 
-static void computeDynamicsMetrics(float &outOverMin, float &outOverMax, int &outOverMinKey, int &outOverMaxKey, int &outNonPosN)
+static inline float calibSigmaVoltage(int key)
+{
+  // _noiseUnscaled is stored in volts for calibration baseline noise.
+  // If unset, return a small default to avoid divide-by-zero.
+  const float s = _noiseUnscaled[key];
+  return (s > 1e-6f) ? s : 0.001f;
+}
+
+static void computeDynamicsMetrics(
+    float &outOverMin, float &outOverMax, int &outOverMinKey, int &outOverMaxKey, int &outNonPosN,
+    int &outDynStepsMin, int &outDynStepsMax, int &outDynStepsMinKey, int &outDynStepsMaxKey, int &outDynDeadN)
 {
   outOverMin = 1e9f;
   outOverMax = -1e9f;
   outOverMinKey = -1;
   outOverMaxKey = -1;
   outNonPosN = 0;
+  outDynStepsMin = 9999;
+  outDynStepsMax = 0;
+  outDynStepsMinKey = -1;
+  outDynStepsMaxKey = -1;
+  outDynDeadN = 0;
   for (int k = _fromKey; k <= _toKey; ++k) {
     if (!_hasZero[k]) continue;
     const float thr = getEffectiveThresholdDelta(k);
     const float over = _maxSwing[k] - thr;
     if (over <= 0.0f) outNonPosN++;
+
+    // Dynamics prognosis: estimate number of stable MIDI velocity levels based
+    // on existing mapping slope and calibration sigma.
+    // dynSteps ~= floor( (maxSwing-thr) / (k*sigmaV) ), clamped to 0..127.
+    const float sigmaV = calibSigmaVoltage(k);
+    const float denom = 3.0f * sigmaV;
+    int dynSteps = 0;
+    if (over > 0.0f && denom > 1e-9f) {
+      dynSteps = (int)floorf(over / denom);
+      if (dynSteps > 127) dynSteps = 127;
+      if (dynSteps < 0) dynSteps = 0;
+    }
+    if (dynSteps <= 0) outDynDeadN++;
+    if (dynSteps < outDynStepsMin) { outDynStepsMin = dynSteps; outDynStepsMinKey = k; }
+    if (dynSteps > outDynStepsMax) { outDynStepsMax = dynSteps; outDynStepsMaxKey = k; }
+
     if (over < outOverMin) { outOverMin = over; outOverMinKey = k; }
     if (over > outOverMax) { outOverMax = over; outOverMaxKey = k; }
   }
-  if (outOverMinKey < 0) { outOverMin = 0.0f; outOverMax = 0.0f; }
+  if (outOverMinKey < 0) {
+    outOverMin = 0.0f;
+    outOverMax = 0.0f;
+    outDynStepsMin = 0;
+    outDynStepsMax = 0;
+    outDynDeadN = 0;
+  }
 }
 
 // --- Autotune overlay persistence (autotune.csv) ---
@@ -1369,6 +1412,7 @@ void handleAutoTuneDump(float* params, int count)
     printJsonKV("avg", _autoBestAvg);
     printJsonKV("sd_us", _autoBestSd);
     printJsonKV("keysPerSec", _autoKeysPerSec);
+    printJsonKV("scansPerSec", _autoScansPerSec);
     printJsonKV("revisitMsEst", _autoRevisitMsEst, true);
     endJson();
 
@@ -1378,7 +1422,12 @@ void handleAutoTuneDump(float* params, int count)
     printJsonKV("overMax", _autoOverMax);
     printJsonKV("overMaxKey", _autoOverMaxKey);
     printJsonKV("nonPosN", _autoOverNonPositiveN);
-    printJsonKV("flag", (_autoOverMin <= 0.0f) ? "!!!" : "ok", true);
+    printJsonKV("dynStepsMin", _autoDynStepsMin);
+    printJsonKV("dynStepsMinKey", _autoDynStepsMinKey);
+    printJsonKV("dynStepsMax", _autoDynStepsMax);
+    printJsonKV("dynStepsMaxKey", _autoDynStepsMaxKey);
+    printJsonKV("dynDeadN", _autoDynStepsDeadN);
+    printJsonKV("flag", (_autoDynStepsMin <= 0) ? "!!!" : "ok", true);
     endJson();
 
     for (int i = 0; i < _autoTrialsN; ++i) {
@@ -2176,11 +2225,15 @@ void handleAutoTuneIdle(float* params, int count)
     _diagActive = diagWas;
     const float secs = (float)ms / 1000.0f;
     _autoKeysPerSec = secs > 0 ? ((float)_scanKeyReads / secs) : 0.0f;
-    _autoRevisitMsEst = _autoKeysPerSec > 0 ? (1000.0f * (float)(_toKey - _fromKey + 1) / _autoKeysPerSec) : 0.0f;
+    const int nKeys = (_toKey - _fromKey + 1);
+    _autoScansPerSec = (nKeys > 0) ? (_autoKeysPerSec / (float)nKeys) : 0.0f;
+    _autoRevisitMsEst = (_autoScansPerSec > 0) ? (1000.0f / _autoScansPerSec) : 0.0f;
   }
 
   {
-    computeDynamicsMetrics(_autoOverMin, _autoOverMax, _autoOverMinKey, _autoOverMaxKey, _autoOverNonPositiveN);
+    computeDynamicsMetrics(
+        _autoOverMin, _autoOverMax, _autoOverMinKey, _autoOverMaxKey, _autoOverNonPositiveN,
+        _autoDynStepsMin, _autoDynStepsMax, _autoDynStepsMinKey, _autoDynStepsMaxKey, _autoDynStepsDeadN);
   }
 
   _autoRunComplete = true;

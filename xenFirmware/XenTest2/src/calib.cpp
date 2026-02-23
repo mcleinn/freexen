@@ -14,6 +14,14 @@ float _autotune_threshold_delta[NUM_KEYS];
 float _zeroVoltage[NUM_KEYS];
 bool _hasZero[NUM_KEYS];
 
+// Baseline drift tracker state (idle-only updates while not playing).
+static bool _baselineKeyActive[NUM_KEYS];
+static elapsedMillis _baselineCooldownMs;
+static const uint32_t _baselineCooldownHoldMs = 1000;
+
+static inline bool baselineCooldownActive() { return _baselineCooldownMs < _baselineCooldownHoldMs; }
+static inline bool isKeyActiveForBaseline(int key) { return _baselineKeyActive[key]; }
+
 // --- Boot baseline drift capture ---
 static float _bootZeroVoltage[NUM_KEYS];
 static bool _bootZeroValid[NUM_KEYS];
@@ -363,6 +371,20 @@ static inline void scanKey(int key)
         const int adc = getAdcUnscaled(key);
         v = getAdcVoltage(adc);
     }
+    // Baseline drift tracking (idle-only).
+    // Update only when the key is idle and the system hasn't played recently.
+    
+    if (_hasZero[key] && !baselineCooldownActive() && !isKeyActiveForBaseline(key)) {
+        const float thr = getEffectiveThresholdDelta(key);
+        const float gate = 0.5f * thr;
+        const float swing = fabsf(v - _zeroVoltage[key]);
+        if (swing < gate) {
+            // Slow IIR towards the current reading (tuned for multi-second drift).
+            const float alpha = 0.0025f;
+            _zeroVoltage[key] = _zeroVoltage[key] + alpha * (v - _zeroVoltage[key]);
+        }
+    }
+
     peakDetect(v, key);
 }
 
@@ -1392,6 +1414,10 @@ void peakDetect(float voltage, int key) {
     static float peak[NUM_KEYS];   // remember the highest reading
     static elapsedMillis msec[NUM_KEYS]; // timer to end states 1 and 2
     static bool playing[NUM_KEYS];
+    // Expose activity state for baseline drift tracker.
+    // 0=idle,1=peak,2=aftershock in this state machine.
+    // Update activity flag for this key.
+    _baselineKeyActive[key] = (state[key] != 0);
   
     if (!_hasZero[key]) return;
 
@@ -1444,8 +1470,10 @@ void peakDetect(float voltage, int key) {
             usbMIDI.sendNoteOn(_fields[board][boardKey].Note, velocity, _fields[board][boardKey].Channel);
             playing[key] = true;     
             LEDStrip->setPixelColor(key, 255, 255, 255);
+            _baselineCooldownMs = 0;
           } else {
             usbMIDI.sendPolyPressure(_fields[board][boardKey].Note, velocity, _fields[board][boardKey].Channel); // Send aftertouch data
+            _baselineCooldownMs = 0;
           }
           msec[key] = 0;
           state[key] = 2;
