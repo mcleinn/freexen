@@ -21,6 +21,10 @@ void handleDumpCalibMeta(float* params, int count);
 void handleCalIssues(float* params, int count);
 void handleAutoTuneIdle(float* params, int count);
 void handleAutoTuneDump(float* params, int count);
+void handleAutoSave(float* params, int count);
+void handleAutoLoad(float* params, int count);
+void handleAutoReset(float* params, int count);
+void handleAutoStat(float* params, int count);
 void handleBootDrift(float* params, int count);
 void handleDriftReset(float* params, int count);
 void handleSaveCalibSlot(float* params, int count);
@@ -30,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 71;
+static const int XEN_FW_VERSION = 72;
 
 static inline void mcpAck()
 {
@@ -91,6 +95,8 @@ static void setMuxDelayRamOnly(int us)
   if (us > 500) us = 500;
   _us_delay_after_mux = us;
 }
+
+static void applyAutotuneSettingsOnBoot();
 
 // --- Autotune run capture (RAM only; keep one run) ---
 static bool _autoHasRun = false;
@@ -207,6 +213,157 @@ static void computeDynamicsMetrics(float &outOverMin, float &outOverMax, int &ou
     if (over > outOverMax) { outOverMax = over; outOverMaxKey = k; }
   }
   if (outOverMinKey < 0) { outOverMin = 0.0f; outOverMax = 0.0f; }
+}
+
+// --- Autotune overlay persistence (autotune.csv) ---
+static const char* kAutoFile = "autotune.csv";
+
+static bool saveAutotuneCSV(int avg, int sd_us)
+{
+  SD.remove(kAutoFile);
+  File f = SD.open(kAutoFile, FILE_WRITE);
+  if (!f) return false;
+  f.print("# fw=");
+  f.print(XEN_FW_VERSION);
+  f.print(" avg=");
+  f.print(avg);
+  f.print(" sd_us=");
+  f.println(sd_us);
+  f.println("key,thr");
+  for (int k = 0; k < NUM_KEYS; ++k) {
+    const float t = _autotune_threshold_delta[k];
+    if (t <= 1e-6f) continue;
+    f.print(k);
+    f.print(',');
+    f.println(t, 6);
+  }
+  f.close();
+  return true;
+}
+
+static bool loadAutotuneCSV(int &outAvg, int &outSd)
+{
+  File f = SD.open(kAutoFile, FILE_READ);
+  if (!f) return false;
+  for (int k = 0; k < NUM_KEYS; ++k) _autotune_threshold_delta[k] = 0.0f;
+  outAvg = -1;
+  outSd = -1;
+
+  bool inData = false;
+  char line[96];
+  int idx = 0;
+  while (f.available()) {
+    int c = f.read();
+    if (c == '\r') continue;
+    if (c != '\n' && idx < (int)sizeof(line) - 1) {
+      line[idx++] = (char)c;
+      continue;
+    }
+    line[idx] = '\0';
+    idx = 0;
+    if (line[0] == 0) continue;
+    if (line[0] == '#') {
+      const char* a = strstr(line, "avg=");
+      const char* s = strstr(line, "sd_us=");
+      if (a) outAvg = atoi(a + 4);
+      if (s) outSd = atoi(s + 6);
+      continue;
+    }
+    if (!inData) {
+      if (strcmp(line, "key,thr") == 0) inData = true;
+      continue;
+    }
+    char* comma = strchr(line, ',');
+    if (!comma) continue;
+    *comma = '\0';
+    const int key = atoi(line);
+    const float thr = atof(comma + 1);
+    if (key >= 0 && key < NUM_KEYS && thr > 1e-6f) _autotune_threshold_delta[key] = thr;
+  }
+  f.close();
+  return true;
+}
+
+static void applyAutotuneSettingsOnBoot()
+{
+  int avg = -1, sd = -1;
+  if (loadAutotuneCSV(avg, sd)) {
+    if (avg > 0) setAveragingRamOnly(avg);
+    if (sd >= 0) setMuxDelayRamOnly(sd);
+  }
+}
+
+void handleAutoReset(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+  for (int k = 0; k < NUM_KEYS; ++k) _autotune_threshold_delta[k] = 0.0f;
+  _println("autoreset ok");
+}
+
+void handleAutoStat(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+  int n = 0;
+  float maxThr = 0.0f;
+  int maxKey = -1;
+  for (int k = 0; k < NUM_KEYS; ++k) {
+    const float t = _autotune_threshold_delta[k];
+    if (t > 1e-6f) {
+      n++;
+      if (t > maxThr) { maxThr = t; maxKey = k; }
+    }
+  }
+  if (_outputFormat) {
+    beginJson("autostat");
+    printJsonKV("ok", 1);
+    printJsonKV("enabledKeys", n);
+    printJsonKV("avg", _measureAvgStandard);
+    printJsonKV("sd_us", _us_delay_after_mux);
+    printJsonKV("maxThr", maxThr);
+    printJsonKV("maxKey", maxKey, true);
+    endJson();
+  } else {
+    _println("autostat enabledKeys=%d avg=%d sd_us=%d maxThr=%.6f key=%d", n, _measureAvgStandard, _us_delay_after_mux, maxThr, maxKey + 1);
+  }
+}
+
+void handleAutoSave(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+  const bool ok = saveAutotuneCSV(_measureAvgStandard, _us_delay_after_mux);
+  if (_outputFormat) {
+    beginJson("autosave");
+    printJsonKV("ok", ok ? 1 : 0);
+    printJsonKV("file", kAutoFile, true);
+    endJson();
+  } else {
+    _println("autosave %s", ok ? "ok" : "failed");
+  }
+}
+
+void handleAutoLoad(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+  int avg = -1, sd = -1;
+  const bool ok = loadAutotuneCSV(avg, sd);
+  if (ok) {
+    if (avg > 0) setAveragingRamOnly(avg);
+    if (sd >= 0) setMuxDelayRamOnly(sd);
+  }
+  if (_outputFormat) {
+    beginJson("autoload");
+    printJsonKV("ok", ok ? 1 : 0);
+    printJsonKV("file", kAutoFile);
+    printJsonKV("avg", avg);
+    printJsonKV("sd_us", sd, true);
+    endJson();
+  } else {
+    _println("autoload failed");
+  }
 }
 
 static void spikeDiagStrictOffenders(int seconds)
@@ -345,6 +502,10 @@ Command commandTable[] = {
   {"calissues", handleCalIssues, "Print last calibration issues (RAM)"},
   {"autotune", handleAutoTuneIdle, "Auto-tune avg/sd for idle=0 (RAM only)"},
   {"autodump", handleAutoTuneDump, "Dump last autotune run (JSONL)"},
+  {"autosave", handleAutoSave, "Save autotune thresholds+avg/sd (autosave)"},
+  {"autoload", handleAutoLoad, "Load autotune thresholds+avg/sd (autoload)"},
+  {"autoreset", handleAutoReset, "Reset autotune thresholds to 0 (disable)"},
+  {"autostat", handleAutoStat, "Show autotune threshold status"},
   {"bootdrift", handleBootDrift, "Print boot drift summary (cached)"},
   {"driftreset", handleDriftReset, "Re-measure boot drift and apply compensation"},
   {"lconf", handleLoadConfig, "Load configuration (optional: program ID)"},
@@ -384,6 +545,9 @@ void setup() {
   setupCard();
   setupMidi();
   setupCalibration();
+
+  // Apply autotune thresholds + avg/sd if present.
+  applyAutotuneSettingsOnBoot();
 
   setupLEDs(280);
   loadConfigurationCSV();
@@ -1645,12 +1809,50 @@ void handleAutoTuneIdle(float* params, int count)
   mcpAck();
   diagBegin();
 
+  const uint32_t progressEveryMs = 1000;
+  uint32_t lastProgressMs = millis();
+  auto progressJson = [&](const char* phase, int avg, int sd, int seconds, int total, float worstExcess, int iter, int adjustedKeys) {
+    if (!_outputFormat) {
+      _println("autotune %s avg=%d sd_us=%d seconds=%d total=%d worstExcess=%.6f iter=%d adj=%d",
+              phase, avg, sd, seconds, total, worstExcess, iter, adjustedKeys);
+      return;
+    }
+    beginJson("autotune");
+    printJsonKV("phase", phase);
+    printJsonKV("runId", (int)_autoRunId);
+    printJsonKV("avg", avg);
+    printJsonKV("sd_us", sd);
+    printJsonKV("seconds", seconds);
+    printJsonKV("total", total);
+    printJsonKV("worstExcess", worstExcess);
+    printJsonKV("iter", iter);
+    printJsonKV("adj", adjustedKeys, true);
+    endJson();
+  };
+  auto progressMaybe = [&](const char* phase, int avg, int sd, int seconds, int total, float worstExcess, int iter, int adjustedKeys) {
+    const uint32_t now = millis();
+    if (now - lastProgressMs < progressEveryMs) return;
+    lastProgressMs = now;
+    progressJson(phase, avg, sd, seconds, total, worstExcess, iter, adjustedKeys);
+  };
+
   // Deterministic staged autotune within ~5 minutes.
   // Params: autotune<shortS>,<midS>,<strictS>,<topK>
   const int shortS = (count >= 1) ? max(2, (int)params[0]) : 5;
   const int midS = (count >= 2) ? max(10, (int)params[1]) : 20;
   const int strictS = (count >= 3) ? max(30, (int)params[2]) : 60;
   const int topK = (count >= 4) ? max(1, min(4, (int)params[3])) : 2;
+
+  if (_outputFormat) {
+    beginJson("autotune_start");
+    printJsonKV("shortS", shortS);
+    printJsonKV("midS", midS);
+    printJsonKV("strictS", strictS);
+    printJsonKV("topK", topK, true);
+    endJson();
+  } else {
+    _println("autotune start short=%ds mid=%ds strict=%ds topK=%d", shortS, midS, strictS, topK);
+  }
 
   const int origAvg = _measureAvgStandard;
   const int origSd  = _us_delay_after_mux;
@@ -1677,8 +1879,14 @@ void handleAutoTuneIdle(float* params, int count)
 
   static uint16_t counts[NUM_KEYS];
   static float maxExc[NUM_KEYS];
-  static float thrOrig[NUM_KEYS];
-  for (int k = 0; k < NUM_KEYS; ++k) thrOrig[k] = _threshold_delta[k];
+  // Always start from calibration thresholds (ignore any existing autotune overlay).
+  static float thrCalib[NUM_KEYS];
+  static float thrWork[NUM_KEYS];
+  for (int k = 0; k < NUM_KEYS; ++k) {
+    thrCalib[k] = _threshold_delta[k];
+    thrWork[k] = _threshold_delta[k];
+    _autotune_threshold_delta[k] = 0.0f;
+  }
 
   _autoHasRun = true;
   _autoRunComplete = false;
@@ -1709,16 +1917,21 @@ void handleAutoTuneIdle(float* params, int count)
       setMuxDelayRamOnly(sd);
 
       for (int k = _fromKey; k <= _toKey; ++k) {
-        if (_hasZero[k]) _threshold_delta[k] = max(minThr, min(maxThr, thrOrig[k]));
+        if (_hasZero[k]) {
+          thrWork[k] = max(minThr, min(maxThr, thrCalib[k]));
+          _autotune_threshold_delta[k] = 0.0f;
+        }
       }
 
       const int total = idleAuditCountsAndMax(shortS, counts, maxExc);
       float worstExcess = 0.0f;
       for (int k = _fromKey; k <= _toKey; ++k) {
         if (!_hasZero[k]) continue;
-        const float excess = maxExc[k] - _threshold_delta[k];
+        const float excess = maxExc[k] - thrWork[k];
         if (excess > worstExcess) worstExcess = excess;
       }
+
+      progressMaybe("A", avg, sd, shortS, total, worstExcess, 0, 0);
 
       if (_autoTrialsN < AUTO_MAX_TRIALS) {
         _autoTrials[_autoTrialsN++] = AutoTrial{avg, sd, shortS, total, 0, 0.0f};
@@ -1778,7 +1991,10 @@ void handleAutoTuneIdle(float* params, int count)
 
     // Reset to calibrated thresholds
     for (int k = _fromKey; k <= _toKey; ++k) {
-      if (_hasZero[k]) _threshold_delta[k] = max(minThr, min(maxThr, thrOrig[k]));
+      if (_hasZero[k]) {
+        thrWork[k] = max(minThr, min(maxThr, thrCalib[k]));
+        _autotune_threshold_delta[k] = 0.0f;
+      }
     }
 
     // Mid pass: measure and set thresholds one-shot
@@ -1787,15 +2003,18 @@ void handleAutoTuneIdle(float* params, int count)
     maxThrSeen = 0.0f;
     maxThrKey = -1;
     for (int k = _fromKey; k <= _toKey; ++k) {
-      _autoThrBefore[k] = _threshold_delta[k];
+      _autoThrBefore[k] = thrWork[k];
       _autoMaxExcursion[k] = maxExc[k];
-      if (!_hasZero[k]) { _autoThrAfter[k] = _threshold_delta[k]; continue; }
-      float thrNew = _threshold_delta[k];
+      if (!_hasZero[k]) { _autoThrAfter[k] = thrWork[k]; continue; }
+      float thrNew = thrWork[k];
       if (maxExc[k] > thrNew) thrNew = min(maxThr, max(maxExc[k] + marginMid, thrNew));
-      if (thrNew > _threshold_delta[k] + 1e-6f) adjustedKeys++;
-      _threshold_delta[k] = thrNew;
+      if (thrNew > thrWork[k] + 1e-6f) adjustedKeys++;
+      thrWork[k] = thrNew;
       _autoThrAfter[k] = thrNew;
       if (thrNew > maxThrSeen) { maxThrSeen = thrNew; maxThrKey = k; }
+
+      // Apply to overlay live so audits use updated thresholds.
+      if (thrNew > max(minThr, min(maxThr, thrCalib[k])) + 1e-6f) _autotune_threshold_delta[k] = thrNew;
     }
 
     // Verify mid stability
@@ -1838,10 +2057,11 @@ void handleAutoTuneIdle(float* params, int count)
         for (int k = _fromKey; k <= _toKey; ++k) {
           if (!_hasZero[k]) continue;
           if (counts[k] == 0) continue;
-          float thrNew = _threshold_delta[k];
+          float thrNew = thrWork[k];
           if (maxExc[k] > thrNew) thrNew = min(maxThr, max(maxExc[k] + marginStrict, thrNew));
-          if (thrNew > _threshold_delta[k] + 1e-6f) adj++;
-          _threshold_delta[k] = thrNew;
+          if (thrNew > thrWork[k] + 1e-6f) adj++;
+          thrWork[k] = thrNew;
+          if (thrNew > max(minThr, min(maxThr, thrCalib[k])) + 1e-6f) _autotune_threshold_delta[k] = thrNew;
           if (thrNew > maxThrSeen) { maxThrSeen = thrNew; maxThrKey = k; }
         }
       }
@@ -1904,6 +2124,9 @@ void handleAutoTuneIdle(float* params, int count)
   }
 
   _autoRunComplete = true;
+
+  // Keep overlay thresholds as the output of this run (already applied live).
+  // Do not touch calibration thresholds (_threshold_delta).
 
   diagEnd();
 }
