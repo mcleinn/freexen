@@ -5,6 +5,93 @@ This document lists the firmware-side tools/commands we use to diagnose and fix:
 - calibration problems (missing baseline/threshold, stuck keys)
 - baseline drift across boots and over time
 
+## How The System Works
+
+This firmware has two layers of "thresholds" and multiple baseline concepts. The
+tools below are designed around those mechanics.
+
+### One-Time Calibration (SD: calib.csv)
+
+Calibration is the per-key model stored on the SD card in `calib.csv` and loaded
+into RAM on boot.
+
+Per key, calibration provides (at least):
+- `zeroVoltage` (baseline at rest)
+- `sigma` (baseline noise)
+- `thr` (threshold delta from baseline)
+- `maxSwing` (approx full-press swing)
+- `pol` (polarity)
+
+Calibration is created/updated by the calibration loop (`x`) and persisted with
+`scalib`. It should be treated as the "ground truth" key model.
+
+### Baseline Detection and Drift Correction
+
+Baseline is used as:
+
+```
+swing = abs(v - baseline)
+trigger if swing > effectiveThreshold
+```
+
+Baseline handling happens in three places:
+
+1) Boot drift compensation (automatic)
+- On boot, we measure boot-time baselines (hands-off) and compare to the
+  calibration baselines.
+- For keys with a boot baseline: runtime baseline is set to the boot baseline.
+- For keys without a per-key boot baseline: runtime baseline is shifted by a
+  per-board median delta.
+- The drift summary is cached and reported by `bootdrift`.
+
+2) `driftreset` (manual)
+- Re-measures boot baselines and re-applies the same compensation while the
+  device is running.
+
+3) Continuous baseline adaptation (automatic, idle-only)
+- During normal scanning, if a key is idle and the system has not played
+  recently, we slowly adapt `_zeroVoltage[key]` toward the current reading.
+- Guards:
+  - per-key: only when the key is idle in the peak-detect state machine
+  - global: short cooldown (about 1s) after NoteOn/aftertouch activity
+  - magnitude: only when swing is below `0.5 * effectiveThreshold`
+
+This combination handles:
+- large boot-to-calibration shifts (boot drift)
+- slow drift during long sessions (continuous adaptation)
+
+### Autotune (SD: autotune.csv)
+
+Autotune is *not* calibration. It is an overlay.
+
+Autotune affects:
+- global scan parameters: `avg` (averaging) and `sd_us` (mux settle delay)
+- overlay thresholds: `_autotune_threshold_delta[key]` (RAM)
+
+Autotune does *not* modify calibration thresholds (`calib.csv`) unless you
+explicitly save calibration.
+
+Effective threshold selection:
+- if `autotune_threshold[key] > 0`: use it
+- else: use calibration `thr`
+
+Autotune persistence:
+- `autosave` writes `autotune.csv` (avg/sd + nonzero overlay thresholds)
+- `autoload` loads it and applies avg/sd and overlays
+- `autoreset` disables overlays by setting them back to 0
+
+### When To Use Which
+
+- If calibration is missing/wrong (bad baseline, broken maxSwing, etc):
+  re-calibrate and save `calib.csv`.
+- If calibration is OK but idle stability is not (false triggers):
+  run autotune and save `autotune.csv`.
+- If boot drift is large but stability is fine:
+  do nothing; drift correction is working.
+- If stability changes during a long session:
+  continuous baseline adaptation should help; if not, run `driftreset` or
+  re-run autotune.
+
 The device prints an immediate ack line for every command:
 
 ```
