@@ -34,16 +34,22 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 76;
+static const int XEN_FW_VERSION = 77;
 
-static inline void mcpAck(const char* cmd)
+static inline void mcpAck(const char* cmd, const char* desc)
 {
   // mcp2serial v0.1.0 only reads whatever is already available ~100ms after
   // sending. Long-running commands must emit an immediate line so the MCP
   // tool call doesn't look like a timeout.
   // Always print a single-line ack first.
   Serial.print("OK:");
-  Serial.println(cmd);
+  Serial.print(cmd);
+  if (desc && desc[0]) {
+    Serial.print(" (");
+    Serial.print(desc);
+    Serial.print(")");
+  }
+  Serial.println();
 }
 
 static inline void diagBegin()
@@ -721,7 +727,7 @@ void parseCommand(char* inputBuffer) {
   // Find matching command
   for (int j = 0; j < commandCount; j++) {
     if (strcmp(cmd, commandTable[j].name) == 0) {
-      mcpAck(inputBuffer);
+      mcpAck(cmd, commandTable[j].description);
       commandTable[j].handler(params, paramCount);
       return;
     }
