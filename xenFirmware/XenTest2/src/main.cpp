@@ -2081,12 +2081,12 @@ void handleAutoTuneIdle(float* params, int count)
     progressJson(phase, avg, sd, seconds, total, worstExcess, iter, adjustedKeys);
   };
 
-  // Deterministic staged autotune within ~5 minutes.
+  // Deterministic staged autotune within ~2 minutes.
   // Params: autotune<shortS>,<midS>,<strictS>,<topK>
-  const int shortS = (count >= 1) ? max(2, (int)params[0]) : 5;
-  const int midS = (count >= 2) ? max(10, (int)params[1]) : 20;
-  const int strictS = (count >= 3) ? max(30, (int)params[2]) : 60;
-  const int topK = (count >= 4) ? max(1, min(4, (int)params[3])) : 2;
+  const int shortS = (count >= 1) ? max(1, (int)params[0]) : 2;
+  const int midS = (count >= 2) ? max(5, (int)params[1]) : 8;
+  const int strictS = (count >= 3) ? max(10, (int)params[2]) : 30;
+  const int topK = (count >= 4) ? max(1, min(2, (int)params[3])) : 1;
 
   if (_outputFormat) {
     beginJson("autotune_start");
@@ -2113,9 +2113,9 @@ void handleAutoTuneIdle(float* params, int count)
   const float marginMid = 0.010f;
   const float marginStrict = 0.015f;
 
-  // Search space (stability-first). Lower values were too optimistic in practice.
-  const int avgCandidates[] = { 32, 64, 128 };
-  const int sdCandidates[]  = { 50, 100, 200 };
+  // Search space: keep small for time budget; strict phase still raises per-key thresholds.
+  const int avgCandidates[] = { 32, 64 };
+  const int sdCandidates[]  = { 20, 50, 100 };
 
   struct GlobalCand {
     int avg;
@@ -2278,7 +2278,7 @@ void handleAutoTuneIdle(float* params, int count)
     // Guarantee: after each strict window, raise thresholds to the maximum
     // observed excursion (+ margin) for offenders, then re-run strict until
     // total==0.
-    for (int iter = 0; iter < 32; ++iter) {
+    for (int iter = 0; iter < 8; ++iter) {
       // Store counts from the current strict pass so spike diagnostics can run.
       memcpy(_autoCountsBest, counts, sizeof(counts));
       if (strictTotal == 0) break;
@@ -2385,6 +2385,19 @@ void handleAutoTuneIdle(float* params, int count)
   }
 
   _autoRunComplete = true;
+
+  // Explicit completion marker so host tools can reliably detect the end of
+  // autotune without heuristics or polling.
+  if (_outputFormat) {
+    beginJson("autotune_done");
+    printJsonKV("runId", (int)_autoRunId);
+    printJsonKV("bestAvg", _autoBestAvg);
+    printJsonKV("bestSd_us", _autoBestSd);
+    printJsonKV("bestTuneTotal", _autoBestTuneTotal);
+    printJsonKV("bestValidateTotal", _autoBestValidateTotal);
+    printJsonKV("complete", 1, true);
+    endJson();
+  }
 
   // Keep overlay thresholds as the output of this run (already applied live).
   // Do not touch calibration thresholds (_threshold_delta).

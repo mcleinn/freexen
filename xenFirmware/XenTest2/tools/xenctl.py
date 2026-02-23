@@ -159,60 +159,6 @@ def _extract_json_objs(lines: list[str]) -> list[dict]:
     return out
 
 
-def _autotune_wait_complete(
-    ss: SerialSession,
-    transcript: list[str],
-    *,
-    max_wait_s: float = 900.0,
-    poll_every_s: float = 2.0,
-) -> bool:
-    """Wait for the last autotune run to become complete.
-
-    Newer firmware emits {"type":"autotune_done",...} at the end of autotune.
-    If we don't see it (older firmware), we fall back to polling autodump.
-    """
-    t0 = time.monotonic()
-    attempt = 0
-    while time.monotonic() - t0 < max_wait_s:
-        drained = ss.drain(max_s=0.25)
-        if drained:
-            transcript.extend(drained)
-            for obj in _extract_json_objs(drained):
-                if obj.get("type") == "autotune_done":
-                    sys.stdout.write("xenctl: saw autotune_done\n")
-                    sys.stdout.flush()
-                    transcript.append("xenctl: saw autotune_done")
-                    return True
-
-        attempt += 1
-        sys.stdout.write(
-            f"xenctl: waiting for autotune completion (poll {attempt})...\n"
-        )
-        sys.stdout.flush()
-        transcript.append(
-            f"xenctl: waiting for autotune completion (poll {attempt})..."
-        )
-
-        ss.send("autodump")
-        lines = ss.read_until(default_stop_for_cmd("autodump"))
-        transcript.extend(lines)
-        objs = _extract_json_objs(lines)
-        for obj in objs:
-            if obj.get("type") == "autodump":
-                if int(obj.get("complete", 0)) == 1:
-                    sys.stdout.write("xenctl: autotune complete=1\n")
-                    sys.stdout.flush()
-                    transcript.append("xenctl: autotune complete=1")
-                    return True
-
-        time.sleep(max(0.2, poll_every_s))
-
-    sys.stdout.write("xenctl: timed out waiting for autotune completion\n")
-    sys.stdout.flush()
-    transcript.append("xenctl: timed out waiting for autotune completion")
-    return False
-
-
 def _wait_for_ok_or_timeout(ss: SerialSession, timeout_s: float) -> bool:
     """Return True if an OK: ack line is observed within timeout_s."""
     t0 = time.monotonic()
@@ -252,11 +198,23 @@ def default_stop_for_cmd(cmd: str) -> CmdSpec:
             quiet_s=3.0,
         )
     if c.startswith("autotune"):
-        # Autotune progress is periodic JSON; wait on quiet.
-        return CmdSpec(text=cmd, stop_kind="quiet", max_s=900.0, quiet_s=5.0)
+        # Autotune now emits a definitive {"type":"autotune_done"} marker.
+        return CmdSpec(
+            text=cmd,
+            stop_kind="json_type",
+            stop_value="autotune_done",
+            max_s=900.0,
+            quiet_s=8.0,
+        )
     if c == "autodump":
-        # Autodump can be long; stop after quiet.
-        return CmdSpec(text=cmd, stop_kind="quiet", max_s=120.0, quiet_s=3.0)
+        # Autodump emits a definitive {"type":"autodump_done"} marker.
+        return CmdSpec(
+            text=cmd,
+            stop_kind="json_type",
+            stop_value="autodump_done",
+            max_s=180.0,
+            quiet_s=5.0,
+        )
     if c in ("testb", "testc", "testd", "teste", "pr2", "pr5", "rate1000"):
         return CmdSpec(text=cmd, stop_kind="quiet", max_s=240.0, quiet_s=3.0)
     return CmdSpec(text=cmd, stop_kind="ok_and_quiet", max_s=60.0, quiet_s=1.5)
@@ -319,10 +277,8 @@ def run_serial_script(
             # If we just launched autotune, wait until the run is complete before
             # proceeding (otherwise follow-up commands like autodump/autostat can
             # run while diag mode is still active).
-            # Avoid follow-up commands that would collide with diag mode.
-            # Newer firmware emits autotune_done; xenctl will wait for it.
-            if cmd.strip().lower().startswith("autotune"):
-                _autotune_wait_complete(ss, transcript)
+            # Firmware emits explicit end markers for autotune/autodump.
+            # No extra supervision needed here.
 
             time.sleep(0.05)
 
