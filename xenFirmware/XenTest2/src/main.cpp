@@ -34,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 72;
+static const int XEN_FW_VERSION = 73;
 
 static inline void mcpAck()
 {
@@ -1857,16 +1857,19 @@ void handleAutoTuneIdle(float* params, int count)
   const int origAvg = _measureAvgStandard;
   const int origSd  = _us_delay_after_mux;
 
+  // Prefer a known-good starting point for tuning runs.
+  setAveragingRamOnly(32);
+  setMuxDelayRamOnly(50);
+
   const float minThr = 0.03f;
   const float maxThr = 0.25f;
   const float marginShort = 0.005f;
   const float marginMid = 0.010f;
   const float marginStrict = 0.015f;
 
-  // Search space (include larger averaging values for stability-first tuning).
-  // Note: Arduino/Teensy analogReadAveraging officially supports up to 32.
-  const int avgCandidates[] = { 4, 8, 16, 32, 64, 128 };
-  const int sdCandidates[]  = { 5, 10, 20, 50, 100, 200 };
+  // Search space (stability-first). Lower values were too optimistic in practice.
+  const int avgCandidates[] = { 32, 64, 128 };
+  const int sdCandidates[]  = { 50, 100, 200 };
 
   struct GlobalCand {
     int avg;
