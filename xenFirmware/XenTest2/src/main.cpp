@@ -34,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 80;
+static const int XEN_FW_VERSION = 81;
 
 static inline void mcpAckRaw(const char* raw, const char* cmd, const char* desc)
 {
@@ -131,6 +131,7 @@ static float _autoOverMin = 0.0f;
 static float _autoOverMax = 0.0f;
 static int _autoOverMinKey = -1;
 static int _autoOverMaxKey = -1;
+static int _autoOverNonPositiveN = 0;
 
 // Capture per-key info from the best candidate.
 static uint16_t _autoCountsBest[NUM_KEYS];
@@ -207,15 +208,18 @@ static int idleAuditCountsAndMax(int seconds, uint16_t* outCounts, float* outMax
   return total;
 }
 
-static void computeDynamicsMetrics(float &outOverMin, float &outOverMax, int &outOverMinKey, int &outOverMaxKey)
+static void computeDynamicsMetrics(float &outOverMin, float &outOverMax, int &outOverMinKey, int &outOverMaxKey, int &outNonPosN)
 {
   outOverMin = 1e9f;
   outOverMax = -1e9f;
   outOverMinKey = -1;
   outOverMaxKey = -1;
+  outNonPosN = 0;
   for (int k = _fromKey; k <= _toKey; ++k) {
     if (!_hasZero[k]) continue;
-    const float over = _maxSwing[k] - _threshold_delta[k];
+    const float thr = getEffectiveThresholdDelta(k);
+    const float over = _maxSwing[k] - thr;
+    if (over <= 0.0f) outNonPosN++;
     if (over < outOverMin) { outOverMin = over; outOverMinKey = k; }
     if (over > outOverMax) { outOverMax = over; outOverMaxKey = k; }
   }
@@ -1366,7 +1370,9 @@ void handleAutoTuneDump(float* params, int count)
     printJsonKV("overMin", _autoOverMin);
     printJsonKV("overMinKey", _autoOverMinKey);
     printJsonKV("overMax", _autoOverMax);
-    printJsonKV("overMaxKey", _autoOverMaxKey, true);
+    printJsonKV("overMaxKey", _autoOverMaxKey);
+    printJsonKV("nonPosN", _autoOverNonPositiveN);
+    printJsonKV("flag", (_autoOverMin <= 0.0f) ? "!!!" : "ok", true);
     endJson();
 
     for (int i = 0; i < _autoTrialsN; ++i) {
@@ -2066,7 +2072,10 @@ void handleAutoTuneIdle(float* params, int count)
     // Strict validation: iterate. If offenders look like carryover glitches,
     // try bumping sd first (RAM-only) and re-run strict.
     int strictTotal = idleAuditCountsAndMax(strictS, counts, maxExc);
-    for (int iter = 0; iter < 4; ++iter) {
+    // Guarantee: after each strict window, raise thresholds to the maximum
+    // observed excursion (+ margin) for offenders, then re-run strict until
+    // total==0.
+    for (int iter = 0; iter < 32; ++iter) {
       // Store counts from the current strict pass so spike diagnostics can run.
       memcpy(_autoCountsBest, counts, sizeof(counts));
       if (strictTotal == 0) break;
@@ -2097,8 +2106,13 @@ void handleAutoTuneIdle(float* params, int count)
         for (int k = _fromKey; k <= _toKey; ++k) {
           if (!_hasZero[k]) continue;
           if (counts[k] == 0) continue;
+
           float thrNew = thrWork[k];
-          if (maxExc[k] > thrNew) thrNew = min(maxThr, max(maxExc[k] + marginStrict, thrNew));
+          const float target = maxExc[k] + marginStrict;
+          if (target > thrNew) thrNew = target;
+          if (thrNew < minThr) thrNew = minThr;
+          if (thrNew > maxThr) thrNew = maxThr;
+
           if (thrNew > thrWork[k] + 1e-6f) adj++;
           thrWork[k] = thrNew;
           if (thrNew > max(minThr, min(maxThr, thrCalib[k])) + 1e-6f) _autotune_threshold_delta[k] = thrNew;
@@ -2160,7 +2174,7 @@ void handleAutoTuneIdle(float* params, int count)
   }
 
   {
-    computeDynamicsMetrics(_autoOverMin, _autoOverMax, _autoOverMinKey, _autoOverMaxKey);
+    computeDynamicsMetrics(_autoOverMin, _autoOverMax, _autoOverMinKey, _autoOverMaxKey, _autoOverNonPositiveN);
   }
 
   _autoRunComplete = true;
