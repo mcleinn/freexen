@@ -36,7 +36,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 90;
+static const int XEN_FW_VERSION = 91;
 
 static inline void mcpAckRaw(const char* raw, const char* cmd, const char* desc)
 {
@@ -68,27 +68,27 @@ static inline void diagEnd()
   updateAllLEDs();
 }
 
-static void printJsonKV(const char* k, const char* v, bool last=false) {
+void printJsonKV(const char* k, const char* v, bool last=false) {
   Serial.print("\""); Serial.print(k); Serial.print("\":\""); Serial.print(v); Serial.print("\"");
   if (!last) Serial.print(",");
 }
 
-static void printJsonKV(const char* k, int v, bool last=false) {
+void printJsonKV(const char* k, int v, bool last=false) {
   Serial.print("\""); Serial.print(k); Serial.print("\":"); Serial.print(v);
   if (!last) Serial.print(",");
 }
 
-static void printJsonKV(const char* k, float v, bool last=false) {
+void printJsonKV(const char* k, float v, bool last=false) {
   Serial.print("\""); Serial.print(k); Serial.print("\":"); Serial.print(v, 6);
   if (!last) Serial.print(",");
 }
 
-static void beginJson(const char* type) {
+void beginJson(const char* type) {
   Serial.print("{");
   printJsonKV("type", type);
 }
 
-static void endJson() {
+void endJson() {
   Serial.println("}");
 }
 

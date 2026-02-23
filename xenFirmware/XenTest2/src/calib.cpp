@@ -1,5 +1,6 @@
 #include "xen.h"
 #include "calib.h"
+#include "jsonl.h"
 #include "midi.h"
 #include "utils.h"
 #include "mux.h"
@@ -1431,12 +1432,22 @@ void peakDetect(float voltage, int key) {
       case 0:
         if (voltageSwing > thr) {
             if (_debugMode) {
-              _print("BEGIN [");
-              _print(key);
-              _print("] ");
-              _print(voltage);
-              _print(" OFF: ");
-              _println(_zeroVoltage[key]);
+              if (_outputFormat) {
+                beginJson("peak_begin");
+                printJsonKV("key", key);
+                printJsonKV("v", voltage);
+                printJsonKV("zero", _zeroVoltage[key]);
+                printJsonKV("swing", voltageSwing);
+                printJsonKV("thr", thr, true);
+                endJson();
+              } else {
+                _print("BEGIN [");
+                _print(key);
+                _print("] ");
+                _print(voltage);
+                _print(" OFF: ");
+                _println(_zeroVoltage[key]);
+              }
             }
   
             peak[key] = voltageSwing;
@@ -1456,13 +1467,47 @@ void peakDetect(float voltage, int key) {
         
         if (msec[key] >= _peakTrackMillis) {     
           int velocity = map(peak[key], thr, _maxSwing[key], 1, 127);
-          if (_debugMode) _println("PEAK [%d] %f %d", key+1, peak[key], velocity);
+          if (_debugMode) {
+            if (_outputFormat) {
+              beginJson("peak_fire");
+              printJsonKV("key", key);
+              printJsonKV("peak", peak[key]);
+              printJsonKV("thr", thr);
+              printJsonKV("maxSwing", _maxSwing[key]);
+              printJsonKV("vel", velocity);
+              printJsonKV("kind", "peak", true);
+              endJson();
+            } else {
+              _println("PEAK [%d] %f %d", key+1, peak[key], velocity);
+            }
+          }
           if (velocity > 127) {
+            const float oldMax = _maxSwing[key];
             _maxSwing[key] = peak[key];
             velocity = map(peak[key], thr, _maxSwing[key], 1, 127);
-            if (_debugMode) _println("CAL [%d] Off=%f On=%f", key+1, _zeroVoltage[key], _maxSwing[key]);
+            if (_debugMode) {
+              if (_outputFormat) {
+                beginJson("peak_clamp");
+                printJsonKV("key", key);
+                printJsonKV("zero", _zeroVoltage[key]);
+                printJsonKV("oldMaxSwing", oldMax);
+                printJsonKV("newMaxSwing", _maxSwing[key], true);
+                endJson();
+              } else {
+                _println("CAL [%d] Off=%f On=%f", key+1, _zeroVoltage[key], _maxSwing[key]);
+              }
+            }
             if (velocity > 127) {
-              if (_debugMode) _println("ERROR: Velocity higher than 127, better investigate!");
+              if (_debugMode) {
+                if (_outputFormat) {
+                  beginJson("peak_error");
+                  printJsonKV("key", key);
+                  printJsonKV("error", "vel_gt_127", true);
+                  endJson();
+                } else {
+                  _println("ERROR: Velocity higher than 127, better investigate!");
+                }
+              }
               velocity = 127;
             }
           }
@@ -1471,9 +1516,27 @@ void peakDetect(float voltage, int key) {
             playing[key] = true;     
             LEDStrip->setPixelColor(key, 255, 255, 255);
             _baselineCooldownMs = 0;
+            if (_debugMode && _outputFormat) {
+              beginJson("midi");
+              printJsonKV("kind", "noteon");
+              printJsonKV("key", key);
+              printJsonKV("note", _fields[board][boardKey].Note);
+              printJsonKV("ch", _fields[board][boardKey].Channel);
+              printJsonKV("vel", velocity, true);
+              endJson();
+            }
           } else {
             usbMIDI.sendPolyPressure(_fields[board][boardKey].Note, velocity, _fields[board][boardKey].Channel); // Send aftertouch data
             _baselineCooldownMs = 0;
+            if (_debugMode && _outputFormat) {
+              beginJson("midi");
+              printJsonKV("kind", "polypressure");
+              printJsonKV("key", key);
+              printJsonKV("note", _fields[board][boardKey].Note);
+              printJsonKV("ch", _fields[board][boardKey].Channel);
+              printJsonKV("val", velocity, true);
+              endJson();
+            }
           }
           msec[key] = 0;
           state[key] = 2;
@@ -1487,7 +1550,15 @@ void peakDetect(float voltage, int key) {
             state[key] = 1; 
         } else if (msec[key] > _aftershockMillis) {
             getBoardAndBoardKey(key, board, boardKey);
-            usbMIDI.sendNoteOff(_fields[board][boardKey].Note, 0, _fields[board][boardKey].Channel);       
+            usbMIDI.sendNoteOff(_fields[board][boardKey].Note, 0, _fields[board][boardKey].Channel);
+            if (_debugMode && _outputFormat) {
+              beginJson("midi");
+              printJsonKV("kind", "noteoff");
+              printJsonKV("key", key);
+              printJsonKV("note", _fields[board][boardKey].Note);
+              printJsonKV("ch", _fields[board][boardKey].Channel, true);
+              endJson();
+            }
             updateLED(key);
             playing[key] = false;
             state[key] = 0; // go back to idle when

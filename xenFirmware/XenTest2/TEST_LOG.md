@@ -323,3 +323,9 @@ Results
 
 Artifacts
 - `autotune_logs\autodump_fw66_capture_20260222_204708.jsonl`
+
+## 2026-02-23 18:08:53
+
+### fw=90
+
+Autotune saved (2-min defaults). LOW noise; idle120=1; overlay enabledKeys=279 avg=32 sd_us=100 maxThr=0.125V key=60; dynStepsMin=9 key=41 dynStepsMax=127 key=168 dynDeadN=0 scansPerSec=8 revisitMsEst=125ms

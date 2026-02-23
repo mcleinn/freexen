@@ -206,6 +206,9 @@ def default_stop_for_cmd(cmd: str) -> CmdSpec:
             max_s=900.0,
             quiet_s=8.0,
         )
+    if c.startswith("l"):
+        # Loop mode changes only ack and print a short line.
+        return CmdSpec(text=cmd, stop_kind="ok_and_quiet", max_s=10.0, quiet_s=0.8)
     if c == "autodump":
         # Autodump emits a definitive {"type":"autodump_done"} marker.
         return CmdSpec(
@@ -240,6 +243,22 @@ def run_serial_script(
 
         total = len(commands)
         for i, cmd in enumerate(commands, start=1):
+            c0 = cmd.strip().lower()
+            if c0.startswith("wait"):
+                # xenctl-only: waitN pauses for N seconds while still teeing serial.
+                # Examples: wait10, wait0.5
+                secs_s = c0[4:].strip()
+                try:
+                    secs = float(secs_s) if secs_s else 1.0
+                except Exception:
+                    secs = 1.0
+                transcript.append(f">>> {cmd}")
+                _print_step(i, total, cmd)
+                sys.stdout.write(f"xenctl: waiting {secs:.3f}s...\n")
+                sys.stdout.flush()
+                time.sleep(max(0.0, secs))
+                continue
+
             spec = default_stop_for_cmd(cmd)
             transcript.append(f">>> {cmd}")
             _print_step(i, total, cmd)
@@ -260,16 +279,14 @@ def run_serial_script(
                 or c.startswith("st")
             )
 
-            if need_ok and not _wait_for_ok_or_timeout(ss, timeout_s=1.0):
+            if need_ok and not _wait_for_ok_or_timeout(ss, timeout_s=2.0):
                 msg = (
-                    f"xenctl: no OK ack within 1.0s for '{cmd}'. "
-                    "Device may be unresponsive or the serial link is wedged. "
-                    "Suggestion: run 'xenctl reset --boot-wait 2.0' or power-cycle."
+                    f"xenctl: no OK ack within 2.0s for '{cmd}' (continuing). "
+                    "If output stalls, reset/power-cycle."
                 )
                 sys.stdout.write(msg + "\n")
                 sys.stdout.flush()
                 transcript.append(msg)
-                break
 
             lines = ss.read_until(spec)
             transcript.extend(lines)
@@ -305,7 +322,14 @@ def cmd_build(args) -> int:
 
 
 def cmd_upload(args) -> int:
-    return pio_run(args.pio, "upload", args.workdir)
+    rc = pio_run(args.pio, "upload", args.workdir)
+    if rc == 0:
+        sys.stdout.write(
+            f"xenctl: upload succeeded, waiting {args.boot_wait:.1f}s for boot...\n"
+        )
+        sys.stdout.flush()
+        time.sleep(max(0.0, args.boot_wait))
+    return rc
 
 
 def cmd_reset(args) -> int:
@@ -397,6 +421,12 @@ def main() -> int:
     ap.add_argument("--port", default="COM3")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--timeout", type=float, default=0.25)
+    ap.add_argument(
+        "--boot-wait",
+        type=float,
+        default=3.0,
+        help="seconds to wait after reset/upload before talking to serial",
+    )
     ap.add_argument("--pio", default=PIO_EXE_DEFAULT)
     ap.add_argument(
         "--workdir", default=os.path.dirname(os.path.abspath(__file__)) + os.sep + ".."
