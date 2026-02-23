@@ -1396,13 +1396,14 @@ void peakDetect(float voltage, int key) {
     if (!_hasZero[key]) return;
 
     float voltageSwing = fabs(_zeroVoltage[key] - voltage); 
+    const float thr = getEffectiveThresholdDelta(key);
     
     switch (state[key]) {
       // IDLE state: wait for any reading is above threshold.  Do not set
       // the threshold too low.  You don't want to be too sensitive to slight
       // vibration.
       case 0:
-        if (voltageSwing > _threshold_delta[key]) {
+        if (voltageSwing > thr) {
             if (_debugMode) {
               _print("BEGIN [");
               _print(key);
@@ -1428,11 +1429,11 @@ void peakDetect(float voltage, int key) {
         }
         
         if (msec[key] >= _peakTrackMillis) {     
-          int velocity = map(peak[key], _threshold_delta[key], _maxSwing[key], 1, 127);
+          int velocity = map(peak[key], thr, _maxSwing[key], 1, 127);
           if (_debugMode) _println("PEAK [%d] %f %d", key+1, peak[key], velocity);
           if (velocity > 127) {
             _maxSwing[key] = peak[key];
-            velocity = map(peak[key], _threshold_delta[key], _maxSwing[key], 1, 127);
+            velocity = map(peak[key], thr, _maxSwing[key], 1, 127);
             if (_debugMode) _println("CAL [%d] Off=%f On=%f", key+1, _zeroVoltage[key], _maxSwing[key]);
             if (velocity > 127) {
               if (_debugMode) _println("ERROR: Velocity higher than 127, better investigate!");
@@ -1453,7 +1454,7 @@ void peakDetect(float voltage, int key) {
   
       // Ignore Aftershock state: wait for things to be quiet azeroPoint.
       default:
-        if (voltageSwing > _threshold_delta[key]) {
+        if (voltageSwing > thr) {
             msec[key] = 0; // keep resetting timer if above threshold
             state[key] = 1; 
         } else if (msec[key] > _aftershockMillis) {

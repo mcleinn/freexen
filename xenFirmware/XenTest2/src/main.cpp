@@ -34,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 82;
+static const int XEN_FW_VERSION = 83;
 
 static inline void mcpAckRaw(const char* raw, const char* cmd, const char* desc)
 {
