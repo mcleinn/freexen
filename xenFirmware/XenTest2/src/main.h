@@ -30,6 +30,8 @@ void handleLoadConfig(float* params, int count);
 void handleSaveConfig(float* params, int count);
 void handleLoadCalib(float* params, int count);
 void handleSaveCalib(float* params, int count);
+void handleSaveCalibSlot(float* params, int count);
+void handleLoadCalibSlot(float* params, int count);
 void handleSetupLEDs(float* params, int count);
 void handleUpdateLEDs(float* params, int count);
 void handleSetupCalib(float* params, int count);

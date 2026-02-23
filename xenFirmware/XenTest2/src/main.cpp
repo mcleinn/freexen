@@ -23,12 +23,14 @@ void handleAutoTuneIdle(float* params, int count);
 void handleAutoTuneDump(float* params, int count);
 void handleBootDrift(float* params, int count);
 void handleDriftReset(float* params, int count);
+void handleSaveCalibSlot(float* params, int count);
+void handleLoadCalibSlot(float* params, int count);
 
 int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 70;
+static const int XEN_FW_VERSION = 71;
 
 static inline void mcpAck()
 {
@@ -349,6 +351,8 @@ Command commandTable[] = {
   {"sconf", handleSaveConfig, "Save configuration (optional: program ID)"},
   {"lcalib", handleLoadCalib, "Load calibration"},
   {"scalib", handleSaveCalib, "Save calibration"},
+  {"bcalib", handleSaveCalibSlot, "Backup calib.csv to slot (bcalib<slot>)"},
+  {"rcalib", handleLoadCalibSlot, "Restore slot to calib.csv+RAM (rcalib<slot>)"},
   {"sled", handleSetupLEDs, "Setup LEDs, optional parameter: number of LEDs (0 to max Key)"},
   {"uled", handleUpdateLEDs, "Update all LEDs with the current configuration"},
   {"h", handleHelp, "Show this help message"},
@@ -671,6 +675,82 @@ void handleLoadCalib(float* params, int count) {
 
 void handleSaveCalib(float* params, int count) {
   saveCalibrationCSV();
+}
+
+static void makeCalibSlotFilename(int slot, char* out, size_t outSize)
+{
+  if (outSize == 0) return;
+  if (slot < 0) slot = 0;
+  if (slot > 999) slot = 999;
+  snprintf(out, outSize, "calib_slot_%03d.csv", slot);
+}
+
+void handleSaveCalibSlot(float* params, int count)
+{
+  mcpAck();
+  const int slot = (count >= 1) ? (int)params[0] : 0;
+  char dst[64];
+  makeCalibSlotFilename(slot, dst, sizeof(dst));
+
+  const char* src = "calib.csv";
+  File in = SD.open(src, FILE_READ);
+  if (!in) {
+    _println("bcalib: failed to open %s", src);
+    return;
+  }
+  SD.remove(dst);
+  File out = SD.open(dst, FILE_WRITE);
+  if (!out) {
+    in.close();
+    _println("bcalib: failed to open %s", dst);
+    return;
+  }
+  uint32_t bytes = 0;
+  uint8_t buf[256];
+  while (true) {
+    int n = in.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    out.write(buf, n);
+    bytes += (uint32_t)n;
+  }
+  out.close();
+  in.close();
+  _println("bcalib: wrote %s (%lu bytes)", dst, (unsigned long)bytes);
+}
+
+void handleLoadCalibSlot(float* params, int count)
+{
+  mcpAck();
+  const int slot = (count >= 1) ? (int)params[0] : 0;
+  char src[64];
+  makeCalibSlotFilename(slot, src, sizeof(src));
+
+  File in = SD.open(src, FILE_READ);
+  if (!in) {
+    _println("rcalib: failed to open %s", src);
+    return;
+  }
+  const char* dst = "calib.csv";
+  SD.remove(dst);
+  File out = SD.open(dst, FILE_WRITE);
+  if (!out) {
+    in.close();
+    _println("rcalib: failed to open %s", dst);
+    return;
+  }
+  uint32_t bytes = 0;
+  uint8_t buf[256];
+  while (true) {
+    int n = in.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    out.write(buf, n);
+    bytes += (uint32_t)n;
+  }
+  out.close();
+  in.close();
+
+  const bool ok = loadCalibrationCSV();
+  _println("rcalib: restored %s (%lu bytes) loadOk=%d", src, (unsigned long)bytes, ok ? 1 : 0);
 }
 
 // Boot drift summary (cached) and reset (remeasure+apply).
