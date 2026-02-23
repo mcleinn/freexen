@@ -3,7 +3,7 @@
 #include "mux.h"
 #include "xen.h"
 
-int _us_delay_after_mux = 10;
+int _us_delay_after_mux = 20;
 
 void setupMux() { 
     for (int i = 0; i < NUM_SELECTLINES; i++) {

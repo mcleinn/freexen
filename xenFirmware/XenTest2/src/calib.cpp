@@ -9,6 +9,8 @@
 #include "main.h"
 
 float _threshold_delta[NUM_KEYS];
+// Autotune threshold overlay (RAM): >0 overrides calibration threshold.
+float _autotune_threshold_delta[NUM_KEYS];
 float _zeroVoltage[NUM_KEYS];
 bool _hasZero[NUM_KEYS];
 
@@ -46,11 +48,11 @@ static uint32_t _calibSettleStartMs = 0;
 volatile uint32_t _scanPasses = 0;
 volatile uint32_t _scanKeyReads = 0;
 
-int _measureAvgStandard = 4;
+int _measureAvgStandard = 32;
 int _measureAvgCalibration = 32;
 
 void setupCalibration() {
-   if (_debugMode) return;
+   memset(_autotune_threshold_delta, 0, sizeof(_autotune_threshold_delta));
    bool ok = !_manualCalibration && loadCalibrationCSV();
    _calibAutoLoadOk = ok;
    _manualCalibration = false;
@@ -98,6 +100,13 @@ static inline void scanKey(int key)
         v = getAdcVoltage(adc);
     }
     peakDetect(v, key);
+}
+
+float getEffectiveThresholdDelta(int key)
+{
+    const float a = _autotune_threshold_delta[key];
+    if (a > 1e-6f) return a;
+    return _threshold_delta[key];
 }
 
 void scanKeysNormal() {
@@ -1130,12 +1139,14 @@ void peakDetect(float voltage, int key) {
       // vibration.
       case 0:
         if (voltageSwing > _threshold_delta[key]) {
-            _print("BEGIN [");
-            _print(key);
-            _print("] ");
-            _print(voltage);
-            _print(" OFF: ");
-            _println(_zeroVoltage[key]);
+            if (_debugMode) {
+              _print("BEGIN [");
+              _print(key);
+              _print("] ");
+              _print(voltage);
+              _print(" OFF: ");
+              _println(_zeroVoltage[key]);
+            }
   
             peak[key] = voltageSwing;
             msec[key] = 0;
@@ -1154,13 +1165,13 @@ void peakDetect(float voltage, int key) {
         
         if (msec[key] >= _peakTrackMillis) {     
           int velocity = map(peak[key], _threshold_delta[key], _maxSwing[key], 1, 127);
-          _println("PEAK [%d] %f %d", key+1, peak[key], velocity);
+          if (_debugMode) _println("PEAK [%d] %f %d", key+1, peak[key], velocity);
           if (velocity > 127) {
             _maxSwing[key] = peak[key];
             velocity = map(peak[key], _threshold_delta[key], _maxSwing[key], 1, 127);
-            _println("CAL [%d] Off=%f On=%f", key+1, _zeroVoltage[key], _maxSwing[key]);
+            if (_debugMode) _println("CAL [%d] Off=%f On=%f", key+1, _zeroVoltage[key], _maxSwing[key]);
             if (velocity > 127) {
-              _println("ERROR: Velocity higher than 127, better investigate!");
+              if (_debugMode) _println("ERROR: Velocity higher than 127, better investigate!");
               velocity = 127;
             }
           }

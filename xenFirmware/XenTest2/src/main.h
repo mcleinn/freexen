@@ -58,6 +58,8 @@ void handleMux(float* params, int count);
 void handleDumpCalib(float* params, int count);
 void handleDumpCalibMeta(float* params, int count);
 void handleCalIssues(float* params, int count);
+void handleAutoTuneIdle(float* params, int count);
+void handleAutoTuneDump(float* params, int count);
 void checkSerial();
 void updateDebugState();
 extern int _currentCalibrationKey, _measureAvgStandard;

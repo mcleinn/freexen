@@ -59,6 +59,9 @@ extern int _fromKey, _toKey, _numberLED;
 extern Adafruit_NeoPixel* LEDStrip;
 
 extern float _threshold_delta[NUM_KEYS];
+// Autotune threshold overlay (RAM): >0 overrides calibration threshold.
+extern float _autotune_threshold_delta[NUM_KEYS];
+float getEffectiveThresholdDelta(int key);
 extern float _zeroVoltage[NUM_KEYS];
 extern bool _hasZero[NUM_KEYS];
 extern float _maxSwing[NUM_KEYS];

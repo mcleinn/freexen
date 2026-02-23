@@ -26,7 +26,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 66;
+static const int XEN_FW_VERSION = 69;
 
 static inline void mcpAck()
 {
@@ -174,13 +174,13 @@ static int idleAuditCountsAndMax(int seconds, uint16_t* outCounts, float* outMax
         const float v = getAdcVoltage(getAdcUnscaled(keyA));
         const float swing = fabsf(v - _zeroVoltage[keyA]);
         if (swing > outMaxExc[keyA]) outMaxExc[keyA] = swing;
-        if (swing > _threshold_delta[keyA] && outCounts[keyA] != 0xFFFF) outCounts[keyA]++;
+        if (swing > getEffectiveThresholdDelta(keyA) && outCounts[keyA] != 0xFFFF) outCounts[keyA]++;
       }
       if (doB) {
         const float v = getAdcVoltage(getAdcUnscaled(keyB));
         const float swing = fabsf(v - _zeroVoltage[keyB]);
         if (swing > outMaxExc[keyB]) outMaxExc[keyB] = swing;
-        if (swing > _threshold_delta[keyB] && outCounts[keyB] != 0xFFFF) outCounts[keyB]++;
+        if (swing > getEffectiveThresholdDelta(keyB) && outCounts[keyB] != 0xFFFF) outCounts[keyB]++;
       }
     }
   }
@@ -311,7 +311,7 @@ Command commandTable[] = {
   {"kc", handleKeyWithColor, "Set key index (no arg for all, otherwise key or from,to)"},
   {"a", handleAveraging, "Set averaging value to 1,2,4,8,16,32"},
   {"sd", handleMuxDelay, "Set mux settle delay in us"},
-  {"t", handleThreshold, "Set threshold"},
+  {"thr", handleThreshold, "Set threshold"},
   {"fmt", handleFormat, "Set output format (0=human, 1=jsonl)"},
   {"c", handleSetColorSelected, "Set color for selected keys (three parameters 0-255)"},
   {"ca", handleSetColorAll, "Set color for all keys (three parameters 0-255)"},
@@ -1020,6 +1020,7 @@ void handleAutoTuneDump(float* params, int count)
   }
 
   if (_outputFormat) {
+    Serial.println("{\"type\":\"autodump_start\"}");
     beginJson("autodump");
     printJsonKV("ok", 1);
     printJsonKV("complete", _autoRunComplete ? 1 : 0);
@@ -1084,6 +1085,8 @@ void handleAutoTuneDump(float* params, int count)
       printJsonKV("thrAfter", _autoThrAfter[k], true);
       endJson();
     }
+
+    Serial.println("{\"type\":\"autodump_done\",\"ok\":1}");
   } else {
     _println("autodump runId=%lu best avg=%d sd=%d tuneTotal=%d validateTotal=%d",
              (unsigned long)_autoRunId, _autoBestAvg, _autoBestSd, _autoBestTuneTotal, _autoBestValidateTotal);
@@ -1476,12 +1479,12 @@ void handleIdleAudit(float* params, int count)
       if (doA) {
         const float v = getAdcVoltage(getAdcUnscaled(keyA));
         const float swing = fabsf(v - _zeroVoltage[keyA]);
-        if (swing > _threshold_delta[keyA] && counts[keyA] != 0xFFFF) counts[keyA]++;
+        if (swing > getEffectiveThresholdDelta(keyA) && counts[keyA] != 0xFFFF) counts[keyA]++;
       }
       if (doB) {
         const float v = getAdcVoltage(getAdcUnscaled(keyB));
         const float swing = fabsf(v - _zeroVoltage[keyB]);
-        if (swing > _threshold_delta[keyB] && counts[keyB] != 0xFFFF) counts[keyB]++;
+        if (swing > getEffectiveThresholdDelta(keyB) && counts[keyB] != 0xFFFF) counts[keyB]++;
       }
     }
   }
@@ -1776,12 +1779,15 @@ void handleAutoTuneIdle(float* params, int count)
   // (These will be emitted by autodump without spamming during the run.)
   {
     const uint32_t ms = 2000;
+    const bool diagWas = _diagActive;
+    _diagActive = false;
     _scanPasses = 0;
     _scanKeyReads = 0;
     const uint32_t t0 = millis();
     while (millis() - t0 < ms) {
       scanKeysNormal();
     }
+    _diagActive = diagWas;
     const float secs = (float)ms / 1000.0f;
     _autoKeysPerSec = secs > 0 ? ((float)_scanKeyReads / secs) : 0.0f;
     _autoRevisitMsEst = _autoKeysPerSec > 0 ? (1000.0f * (float)(_toKey - _fromKey + 1) / _autoKeysPerSec) : 0.0f;
