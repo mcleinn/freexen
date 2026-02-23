@@ -34,16 +34,16 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 78;
+static const int XEN_FW_VERSION = 80;
 
-static inline void mcpAck(const char* cmd, const char* desc)
+static inline void mcpAckRaw(const char* raw, const char* cmd, const char* desc)
 {
   // mcp2serial v0.1.0 only reads whatever is already available ~100ms after
   // sending. Long-running commands must emit an immediate line so the MCP
   // tool call doesn't look like a timeout.
   // Always print a single-line ack first.
   Serial.print("OK:");
-  Serial.print(cmd);
+  Serial.print(raw);
   if (desc && desc[0]) {
     Serial.print(" <-- ");
     Serial.print(desc);
@@ -726,7 +726,7 @@ void parseCommand(char* inputBuffer) {
   // Find matching command
   for (int j = 0; j < commandCount; j++) {
     if (strcmp(cmd, commandTable[j].name) == 0) {
-      mcpAck(cmd, commandTable[j].description);
+      mcpAckRaw(inputBuffer, cmd, commandTable[j].description);
       commandTable[j].handler(params, paramCount);
       return;
     }
@@ -1898,7 +1898,8 @@ void handleAutoTuneIdle(float* params, int count)
   setMuxDelayRamOnly(50);
 
   const float minThr = 0.03f;
-  const float maxThr = 0.25f;
+  // No explicit max threshold clamp; only clamp to ADC/physics limits.
+  const float maxThr = MAX_VOLTAGE;
   const float marginShort = 0.005f;
   const float marginMid = 0.010f;
   const float marginStrict = 0.015f;
