@@ -39,6 +39,10 @@ void showNoise(int adc);
 void printNoiseLevels();
 void clearCalibration(int fromKey, int toKey);
 
+// Boot drift commands
+void bootDriftPrintSummary();
+void driftReset();
+
 // Dumps the last calibration run issues (RAM state)
 void printLastCalibrationIssues();
 

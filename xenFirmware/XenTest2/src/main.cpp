@@ -21,12 +21,14 @@ void handleDumpCalibMeta(float* params, int count);
 void handleCalIssues(float* params, int count);
 void handleAutoTuneIdle(float* params, int count);
 void handleAutoTuneDump(float* params, int count);
+void handleBootDrift(float* params, int count);
+void handleDriftReset(float* params, int count);
 
 int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 69;
+static const int XEN_FW_VERSION = 70;
 
 static inline void mcpAck()
 {
@@ -341,6 +343,8 @@ Command commandTable[] = {
   {"calissues", handleCalIssues, "Print last calibration issues (RAM)"},
   {"autotune", handleAutoTuneIdle, "Auto-tune avg/sd for idle=0 (RAM only)"},
   {"autodump", handleAutoTuneDump, "Dump last autotune run (JSONL)"},
+  {"bootdrift", handleBootDrift, "Print boot drift summary (cached)"},
+  {"driftreset", handleDriftReset, "Re-measure boot drift and apply compensation"},
   {"lconf", handleLoadConfig, "Load configuration (optional: program ID)"},
   {"sconf", handleSaveConfig, "Save configuration (optional: program ID)"},
   {"lcalib", handleLoadCalib, "Load calibration"},
@@ -381,8 +385,7 @@ void setup() {
   loadConfigurationCSV();
   updateAllLEDs();
 
-  if (!connected)
-    loadCalibrationCSV();
+  // Calibration is loaded by setupCalibration() for both debug + non-debug.
 
   // Boot status banner
   if (Serial && Serial.dtr()) {
@@ -478,6 +481,11 @@ void updateDebugState()
                 XEN_FW_VERSION,
                 _calibAutoLoadOk ? 1 : 0);
       }
+
+      // Print minimal drift summary on debug attach (no re-measure).
+      // Baseline compensation already happened in setupCalibration().
+      extern void bootDriftPrintSummary();
+      bootDriftPrintSummary();
     }
     else if (!connected && _debugMode) {        
       _debugMode      = false;
@@ -663,6 +671,24 @@ void handleLoadCalib(float* params, int count) {
 
 void handleSaveCalib(float* params, int count) {
   saveCalibrationCSV();
+}
+
+// Boot drift summary (cached) and reset (remeasure+apply).
+extern void bootDriftPrintSummary();
+extern void driftReset();
+
+void handleBootDrift(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+  bootDriftPrintSummary();
+}
+
+void handleDriftReset(float* params, int count)
+{
+  (void)params; (void)count;
+  mcpAck();
+  driftReset();
 }
 
 void handleSetupLEDs(float* params, int count) {

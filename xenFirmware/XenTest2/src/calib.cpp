@@ -14,6 +14,264 @@ float _autotune_threshold_delta[NUM_KEYS];
 float _zeroVoltage[NUM_KEYS];
 bool _hasZero[NUM_KEYS];
 
+// --- Boot baseline drift capture ---
+static float _bootZeroVoltage[NUM_KEYS];
+static bool _bootZeroValid[NUM_KEYS];
+
+static float _bootBoardDelta[NUM_BOARDS];
+static bool _bootBoardDeltaValid[NUM_BOARDS];
+
+static bool _bootDriftHasCache = false;
+static int _bootDriftNCalib = 0;
+static int _bootDriftNBootValid = 0;
+static int _bootDriftNBootMissing = 0;
+static float _bootDriftAvgAbs = 0.0f;
+static float _bootDriftMedAbs = 0.0f;
+static float _bootDriftMaxAbs = 0.0f;
+static int _bootDriftMaxKey = -1;
+static float _bootDriftMedDelta = 0.0f;
+
+static void bootDriftCacheReset()
+{
+  _bootDriftHasCache = false;
+  _bootDriftNCalib = 0;
+  _bootDriftNBootValid = 0;
+  _bootDriftNBootMissing = 0;
+  _bootDriftAvgAbs = 0.0f;
+  _bootDriftMedAbs = 0.0f;
+  _bootDriftMaxAbs = 0.0f;
+  _bootDriftMaxKey = -1;
+  _bootDriftMedDelta = 0.0f;
+  for (int b = 0; b < NUM_BOARDS; ++b) {
+    _bootBoardDelta[b] = 0.0f;
+    _bootBoardDeltaValid[b] = false;
+  }
+  memset(_bootZeroVoltage, 0, sizeof(_bootZeroVoltage));
+  memset(_bootZeroValid, 0, sizeof(_bootZeroValid));
+}
+
+static void bootDriftPrintSummaryImpl()
+{
+  if (!_bootDriftHasCache) {
+    if (_outputFormat) {
+      Serial.println("{\"type\":\"bootdrift_sum\",\"ok\":0,\"error\":\"no_cache\"}");
+    } else {
+      _println("bootdrift ok=0 error=no_cache");
+    }
+    return;
+  }
+  if (_outputFormat) {
+    Serial.print("{\"type\":\"bootdrift_sum\",\"ok\":1,\"nCalib\":");
+    Serial.print(_bootDriftNCalib);
+    Serial.print(",\"nBootValid\":");
+    Serial.print(_bootDriftNBootValid);
+    Serial.print(",\"nBootMissing\":");
+    Serial.print(_bootDriftNBootMissing);
+    Serial.print(",\"avgAbs\":");
+    Serial.print(_bootDriftAvgAbs, 6);
+    Serial.print(",\"medAbs\":");
+    Serial.print(_bootDriftMedAbs, 6);
+    Serial.print(",\"maxAbs\":");
+    Serial.print(_bootDriftMaxAbs, 6);
+    Serial.print(",\"maxKey\":");
+    Serial.print(_bootDriftMaxKey);
+    Serial.print(",\"medDelta\":");
+    Serial.print(_bootDriftMedDelta, 6);
+    Serial.println("}");
+  } else {
+    _println("bootdrift nCalib=%d valid=%d missing=%d avgAbs=%.6fV medAbs=%.6fV maxAbs=%.6fV key=%d medDelta=%.6fV",
+            _bootDriftNCalib,
+            _bootDriftNBootValid,
+            _bootDriftNBootMissing,
+            _bootDriftAvgAbs,
+            _bootDriftMedAbs,
+            _bootDriftMaxAbs,
+            _bootDriftMaxKey + 1,
+            _bootDriftMedDelta);
+  }
+}
+
+static int clampInt(int v, int lo, int hi) { if (v < lo) return lo; if (v > hi) return hi; return v; }
+
+static float medianDeltaFromHist(const uint16_t* hist, int bins, int n, int offset)
+{
+  if (n <= 0) return 0.0f;
+  int target = (n + 1) / 2;
+  int acc = 0;
+  for (int i = 0; i < bins; ++i) {
+    acc += hist[i];
+    if (acc >= target) {
+      const int mv = i - offset;
+      return (float)mv / 1000.0f;
+    }
+  }
+  return 0.0f;
+}
+
+static void computeBoardDeltas(const float* calibZero)
+{
+  // Signed delta histogram in mV: [-999..999]
+  static uint16_t histAll[1999];
+  memset(histAll, 0, sizeof(histAll));
+  int nAll = 0;
+
+  static uint16_t histBoard[NUM_BOARDS][1999];
+  static int nBoard[NUM_BOARDS];
+  for (int b = 0; b < NUM_BOARDS; ++b) {
+    memset(histBoard[b], 0, sizeof(histBoard[b]));
+    nBoard[b] = 0;
+  }
+
+  for (int k = 0; k < NUM_KEYS; ++k) {
+    if (!_hasZero[k]) continue;
+    if (!_bootZeroValid[k]) continue;
+    const float d = _bootZeroVoltage[k] - calibZero[k];
+    int mv = (int)(d * 1000.0f + (d >= 0 ? 0.5f : -0.5f));
+    mv = clampInt(mv, -999, 999);
+    histAll[mv + 999]++;
+    nAll++;
+
+    int board, boardKey;
+    getBoardAndBoardKey(k, board, boardKey);
+    if (board >= 0 && board < NUM_BOARDS) {
+      histBoard[board][mv + 999]++;
+      nBoard[board]++;
+    }
+  }
+
+  const float medAll = medianDeltaFromHist(histAll, 1999, nAll, 999);
+  _bootDriftMedDelta = medAll;
+
+  for (int b = 0; b < NUM_BOARDS; ++b) {
+    if (nBoard[b] >= 8) {
+      _bootBoardDelta[b] = medianDeltaFromHist(histBoard[b], 1999, nBoard[b], 999);
+      _bootBoardDeltaValid[b] = true;
+    } else {
+      _bootBoardDelta[b] = medAll;
+      _bootBoardDeltaValid[b] = (nAll > 0);
+    }
+  }
+}
+
+static void applyBootDriftToBaseline(const float* calibZero)
+{
+  // Recommended behavior:
+  // - If per-key boot baseline exists: use it.
+  // - Else: use per-board median delta fallback.
+  for (int k = 0; k < NUM_KEYS; ++k) {
+    if (!_hasZero[k]) continue;
+    if (_bootZeroValid[k]) {
+      _zeroVoltage[k] = _bootZeroVoltage[k];
+      continue;
+    }
+    int board, boardKey;
+    getBoardAndBoardKey(k, board, boardKey);
+    float d = _bootDriftMedDelta;
+    if (board >= 0 && board < NUM_BOARDS && _bootBoardDeltaValid[board]) d = _bootBoardDelta[board];
+    _zeroVoltage[k] = calibZero[k] + d;
+  }
+}
+
+static void captureBootBaselinesInternal(bool verbose)
+{
+  // Requires calibration baseline present (calibZero snapshot).
+  static float calibZero[NUM_KEYS];
+  for (int k = 0; k < NUM_KEYS; ++k) calibZero[k] = _zeroVoltage[k];
+
+  // Measure boot baselines
+  memset(_bootZeroVoltage, 0, sizeof(_bootZeroVoltage));
+  memset(_bootZeroValid, 0, sizeof(_bootZeroValid));
+
+  analogReadAveraging(_measureAvgStandard > 32 ? 32 : _measureAvgStandard);
+  const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD;
+  const int samplesPerKey = 12;
+  const int settleUs = max(20, _us_delay_after_mux);
+
+  for (int muxPos = 0; muxPos < OFFSET; ++muxPos) {
+    const int keyA = muxPos;
+    const int keyB = muxPos + OFFSET;
+    const bool doA = (keyA >= 0 && keyA < NUM_KEYS) && _hasZero[keyA];
+    const bool doB = (keyB >= 0 && keyB < NUM_KEYS) && _hasZero[keyB];
+    if (!doA && !doB) continue;
+
+    setKey(muxPos);
+    delayMicroseconds(settleUs);
+    (void)getAdcUnscaledRawByIndex(ADC_UNSCALED1);
+    (void)getAdcUnscaledRawByIndex(ADC_UNSCALED2);
+    float sumA = 0.0f, sumB = 0.0f;
+    for (int i = 0; i < samplesPerKey; ++i) {
+      if (doA) sumA += getAdcVoltage(getAdcUnscaled(keyA));
+      if (doB) sumB += getAdcVoltage(getAdcUnscaled(keyB));
+    }
+    if (doA) { _bootZeroVoltage[keyA] = sumA / (float)samplesPerKey; _bootZeroValid[keyA] = true; }
+    if (doB) { _bootZeroVoltage[keyB] = sumB / (float)samplesPerKey; _bootZeroValid[keyB] = true; }
+  }
+
+  // Drift stats (abs) + median abs
+  static uint16_t histAbsMv[1000];
+  memset(histAbsMv, 0, sizeof(histAbsMv));
+  int n = 0;
+  float sumAbs = 0.0f;
+  float maxAbs = 0.0f;
+  int maxKey = -1;
+  int nCalib = 0;
+  for (int k = 0; k < NUM_KEYS; ++k) if (_hasZero[k]) nCalib++;
+
+  for (int k = 0; k < NUM_KEYS; ++k) {
+    if (!_hasZero[k]) continue;
+    if (!_bootZeroValid[k]) continue;
+    const float d = _bootZeroVoltage[k] - calibZero[k];
+    const float ad = fabsf(d);
+    n++;
+    sumAbs += ad;
+    if (ad > maxAbs) { maxAbs = ad; maxKey = k; }
+    int mv = (int)(ad * 1000.0f + 0.5f);
+    if (mv < 0) mv = 0;
+    if (mv > 999) mv = 999;
+    histAbsMv[mv]++;
+  }
+  int medMv = 0;
+  if (n > 0) {
+    const int target = (n + 1) / 2;
+    int acc = 0;
+    for (int mv = 0; mv < 1000; ++mv) { acc += histAbsMv[mv]; if (acc >= target) { medMv = mv; break; } }
+  }
+
+  _bootDriftHasCache = true;
+  _bootDriftNCalib = nCalib;
+  _bootDriftNBootValid = n;
+  _bootDriftNBootMissing = max(0, nCalib - n);
+  _bootDriftAvgAbs = (n > 0) ? (sumAbs / (float)n) : 0.0f;
+  _bootDriftMedAbs = (float)medMv / 1000.0f;
+  _bootDriftMaxAbs = maxAbs;
+  _bootDriftMaxKey = maxKey;
+
+  computeBoardDeltas(calibZero);
+  applyBootDriftToBaseline(calibZero);
+
+  // Minimal summary always; verbose only when requested.
+  bootDriftPrintSummaryImpl();
+  (void)verbose;
+}
+
+void bootDriftPrintSummary()
+{
+  bootDriftPrintSummaryImpl();
+}
+
+void driftReset()
+{
+  if (!_calibAutoLoadOk) {
+    if (_outputFormat) {
+      Serial.println("{\"type\":\"bootdrift_sum\",\"ok\":0,\"error\":\"calib_not_loaded\"}");
+    } else {
+      _println("bootdrift ok=0 error=calib_not_loaded");
+    }
+    return;
+  }
+  captureBootBaselinesInternal(true);
+}
+
 int _currentCalibrationKey = 0;
 int _calibLoopState = STATE_CALIBRATION_START;
 float _maxSwing[NUM_KEYS];
@@ -53,9 +311,15 @@ int _measureAvgCalibration = 32;
 
 void setupCalibration() {
    memset(_autotune_threshold_delta, 0, sizeof(_autotune_threshold_delta));
+   bootDriftCacheReset();
    bool ok = !_manualCalibration && loadCalibrationCSV();
    _calibAutoLoadOk = ok;
    _manualCalibration = false;
+
+   // Compute/apply boot drift compensation once calibration is loaded.
+   if (ok) {
+     captureBootBaselinesInternal(false);
+   }
    
    if (!ok) {    
      _calibLoopState = STATE_CALIBRATION_START;
