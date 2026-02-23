@@ -34,14 +34,16 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 74;
+static const int XEN_FW_VERSION = 75;
 
-static inline void mcpAck()
+static inline void mcpAck(const char* cmd)
 {
   // mcp2serial v0.1.0 only reads whatever is already available ~100ms after
   // sending. Long-running commands must emit an immediate line so the MCP
   // tool call doesn't look like a timeout.
-  Serial.println("OK");
+  // Always print a single-line ack first.
+  Serial.print("OK:");
+  Serial.println(cmd);
 }
 
 static inline void diagBegin()
@@ -296,7 +298,6 @@ static void applyAutotuneSettingsOnBoot()
 void handleAutoReset(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
   for (int k = 0; k < NUM_KEYS; ++k) _autotune_threshold_delta[k] = 0.0f;
   _println("autoreset ok");
 }
@@ -304,7 +305,6 @@ void handleAutoReset(float* params, int count)
 void handleAutoStat(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
   int n = 0;
   float maxThr = 0.0f;
   int maxKey = -1;
@@ -332,7 +332,6 @@ void handleAutoStat(float* params, int count)
 void handleAutoSave(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
   const bool ok = saveAutotuneCSV(_measureAvgStandard, _us_delay_after_mux);
   if (_outputFormat) {
     beginJson("autosave");
@@ -347,7 +346,6 @@ void handleAutoSave(float* params, int count)
 void handleAutoLoad(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
   int avg = -1, sd = -1;
   const bool ok = loadAutotuneCSV(avg, sd);
   if (ok) {
@@ -723,6 +721,7 @@ void parseCommand(char* inputBuffer) {
   // Find matching command
   for (int j = 0; j < commandCount; j++) {
     if (strcmp(cmd, commandTable[j].name) == 0) {
+      mcpAck(inputBuffer);
       commandTable[j].handler(params, paramCount);
       return;
     }
@@ -851,7 +850,6 @@ static void makeCalibSlotFilename(int slot, char* out, size_t outSize)
 
 void handleSaveCalibSlot(float* params, int count)
 {
-  mcpAck();
   const int slot = (count >= 1) ? (int)params[0] : 0;
   char dst[64];
   makeCalibSlotFilename(slot, dst, sizeof(dst));
@@ -909,7 +907,6 @@ void handleSaveCalibSlot(float* params, int count)
 
 void handleLoadCalibSlot(float* params, int count)
 {
-  mcpAck();
   const int slot = (count >= 1) ? (int)params[0] : 0;
   char src[64];
   makeCalibSlotFilename(slot, src, sizeof(src));
@@ -974,14 +971,12 @@ extern void driftReset();
 void handleBootDrift(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
   bootDriftPrintSummary();
 }
 
 void handleDriftReset(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
   driftReset();
 }
 
@@ -1102,7 +1097,6 @@ void handleReset(float* params, int count)
 void handleVersion(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
   if (_outputFormat) {
     beginJson("ver");
     printJsonKV("fw", XEN_FW_VERSION, true);
@@ -1115,7 +1109,6 @@ void handleVersion(float* params, int count)
 void handleCalStat(float* params, int count)
 {
   (void)params; (void)count;
-  mcpAck();
 
   int hasZero = 0;
   int hasThr = 0;
@@ -1175,7 +1168,6 @@ void handleDumpCalib(float* params, int count)
 {
   (void)params;
   (void)count;
-  mcpAck();
 
   // Report whether current RAM calibration differs from last loaded/saved state.
   if (_outputFormat) {
@@ -1218,7 +1210,6 @@ void handleCalIssues(float* params, int count)
 {
   (void)params;
   (void)count;
-  mcpAck();
   printLastCalibrationIssues();
 }
 
@@ -1226,7 +1217,6 @@ void handleDumpCalibMeta(float* params, int count)
 {
   (void)params;
   (void)count;
-  mcpAck();
 
   File f = SD.open("calib_meta.csv", FILE_READ);
   if (!f) {
@@ -1328,7 +1318,6 @@ void handleAutoTuneDump(float* params, int count)
 {
   (void)params;
   (void)count;
-  mcpAck();
 
   if (!_autoHasRun) {
     if (_outputFormat) {
@@ -1424,7 +1413,6 @@ void handleClearCalib(float* params, int count)
 
 void handleReadKey(float* params, int count)
 {
-  mcpAck();
   int key = _fromKey;
   if (count >= 1) key = (int)params[0] - 1;
   if (key < 0 || key >= NUM_KEYS) return;
@@ -1465,7 +1453,6 @@ void handleReadKey(float* params, int count)
 
 void handleReadStats(float* params, int count)
 {
-  mcpAck();
   if (count < 1) return;
   const int key = (int)params[0] - 1;
   const int ms = (count >= 2) ? (int)params[1] : 500;
@@ -1511,7 +1498,6 @@ void handleReadStats(float* params, int count)
 
 void handleProblemReport(float* params, int count)
 {
-  mcpAck();
   diagBegin();
   const int seconds = (count >= 1) ? max(1, (int)params[0]) : 2;
   const int ms = seconds * 1000;
@@ -1568,7 +1554,6 @@ void handleProblemReport(float* params, int count)
 
 void handleRate(float* params, int count)
 {
-  mcpAck();
   diagBegin();
   const int ms = (count >= 1) ? max(100, (int)params[0]) : 1000;
   const int OFFSET = BOARDS_PER_ADC_CHANNEL * NUM_KEYS_PER_BOARD;
@@ -1621,7 +1606,6 @@ static float keySteadyVoltage(int key)
 
 void handleSettleTest(float* params, int count)
 {
-  mcpAck();
   diagBegin();
   if (count < 4) { diagEnd(); return; }
   const int keyA = (int)params[0] - 1;
@@ -1676,7 +1660,6 @@ void handleSettleTest(float* params, int count)
 
 void handleSettleSweep(float* params, int count)
 {
-  mcpAck();
   diagBegin();
   if (count < 2) { diagEnd(); return; }
   const int keyA = (int)params[0] - 1;
@@ -1769,7 +1752,6 @@ void handleSettleSweep(float* params, int count)
 
 void handleIdleAudit(float* params, int count)
 {
-  mcpAck();
   diagBegin();
 
   const int seconds = (count >= 1) ? max(1, (int)params[0]) : 30;
@@ -1856,7 +1838,6 @@ void handleIdleAudit(float* params, int count)
 
 void handleAutoTuneIdle(float* params, int count)
 {
-  mcpAck();
   diagBegin();
 
   const uint32_t progressEveryMs = 1000;
@@ -2186,7 +2167,6 @@ void handleAutoTuneIdle(float* params, int count)
 
 void handleRuntimePerf(float* params, int count)
 {
-  mcpAck();
   diagBegin();
 
   const int seconds = (count >= 1) ? max(1, (int)params[0]) : 5;
@@ -2495,7 +2475,6 @@ void handleTest3(float* params, int count)
 
 void handleTest6(float* params, int count)
 {
-  mcpAck();
   diagBegin();
   (void)params; (void)count;
   const int avgs[] = {1, 2, 4, 8, 16, 32};
