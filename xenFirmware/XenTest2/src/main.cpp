@@ -34,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 73;
+static const int XEN_FW_VERSION = 74;
 
 static inline void mcpAck()
 {
@@ -859,14 +859,30 @@ void handleSaveCalibSlot(float* params, int count)
   const char* src = "calib.csv";
   File in = SD.open(src, FILE_READ);
   if (!in) {
-    _println("bcalib: failed to open %s", src);
+    if (_outputFormat) {
+      beginJson("bcalib");
+      printJsonKV("ok", 0);
+      printJsonKV("error", "open_src");
+      printJsonKV("file", src, true);
+      endJson();
+    } else {
+      _println("bcalib: failed to open %s", src);
+    }
     return;
   }
   SD.remove(dst);
   File out = SD.open(dst, FILE_WRITE);
   if (!out) {
     in.close();
-    _println("bcalib: failed to open %s", dst);
+    if (_outputFormat) {
+      beginJson("bcalib");
+      printJsonKV("ok", 0);
+      printJsonKV("error", "open_dst");
+      printJsonKV("file", dst, true);
+      endJson();
+    } else {
+      _println("bcalib: failed to open %s", dst);
+    }
     return;
   }
   uint32_t bytes = 0;
@@ -879,7 +895,16 @@ void handleSaveCalibSlot(float* params, int count)
   }
   out.close();
   in.close();
-  _println("bcalib: wrote %s (%lu bytes)", dst, (unsigned long)bytes);
+  if (_outputFormat) {
+    beginJson("bcalib");
+    printJsonKV("ok", 1);
+    printJsonKV("slot", slot);
+    printJsonKV("file", dst);
+    printJsonKV("bytes", (int)bytes, true);
+    endJson();
+  } else {
+    _println("bcalib: wrote %s (%lu bytes)", dst, (unsigned long)bytes);
+  }
 }
 
 void handleLoadCalibSlot(float* params, int count)
@@ -891,7 +916,15 @@ void handleLoadCalibSlot(float* params, int count)
 
   File in = SD.open(src, FILE_READ);
   if (!in) {
-    _println("rcalib: failed to open %s", src);
+    if (_outputFormat) {
+      beginJson("rcalib");
+      printJsonKV("ok", 0);
+      printJsonKV("error", "open_src");
+      printJsonKV("file", src, true);
+      endJson();
+    } else {
+      _println("rcalib: failed to open %s", src);
+    }
     return;
   }
   const char* dst = "calib.csv";
@@ -899,7 +932,15 @@ void handleLoadCalibSlot(float* params, int count)
   File out = SD.open(dst, FILE_WRITE);
   if (!out) {
     in.close();
-    _println("rcalib: failed to open %s", dst);
+    if (_outputFormat) {
+      beginJson("rcalib");
+      printJsonKV("ok", 0);
+      printJsonKV("error", "open_dst");
+      printJsonKV("file", dst, true);
+      endJson();
+    } else {
+      _println("rcalib: failed to open %s", dst);
+    }
     return;
   }
   uint32_t bytes = 0;
@@ -914,7 +955,16 @@ void handleLoadCalibSlot(float* params, int count)
   in.close();
 
   const bool ok = loadCalibrationCSV();
-  _println("rcalib: restored %s (%lu bytes) loadOk=%d", src, (unsigned long)bytes, ok ? 1 : 0);
+  if (_outputFormat) {
+    beginJson("rcalib");
+    printJsonKV("ok", ok ? 1 : 0);
+    printJsonKV("slot", slot);
+    printJsonKV("file", src);
+    printJsonKV("bytes", (int)bytes, true);
+    endJson();
+  } else {
+    _println("rcalib: restored %s (%lu bytes) loadOk=%d", src, (unsigned long)bytes, ok ? 1 : 0);
+  }
 }
 
 // Boot drift summary (cached) and reset (remeasure+apply).
