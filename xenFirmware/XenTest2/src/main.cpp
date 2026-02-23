@@ -34,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 77;
+static const int XEN_FW_VERSION = 78;
 
 static inline void mcpAck(const char* cmd, const char* desc)
 {
@@ -45,9 +45,8 @@ static inline void mcpAck(const char* cmd, const char* desc)
   Serial.print("OK:");
   Serial.print(cmd);
   if (desc && desc[0]) {
-    Serial.print(" (");
+    Serial.print(" <-- ");
     Serial.print(desc);
-    Serial.print(")");
   }
   Serial.println();
 }
