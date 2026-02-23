@@ -3,7 +3,7 @@ serial:
   baud_rate: 115200
   timeout: 1.0
   read_timeout: 15.0
-  response_start_string: "OK"
+  response_start_string: "OK:"
 
 commands:
   set_format_json:
@@ -67,10 +67,58 @@ commands:
 
 
   set_threshold:
-    command: "t{volts}\n"
+    command: "thr{volts}\n"
     need_parse: false
     prompts:
       - "set threshold to {volts}"
+
+  bootdrift:
+    command: "bootdrift\n"
+    need_parse: false
+    prompts:
+      - "show boot drift"
+
+  driftreset:
+    command: "driftreset\n"
+    need_parse: false
+    prompts:
+      - "remeasure boot drift"
+
+  autosave:
+    command: "autosave\n"
+    need_parse: false
+    prompts:
+      - "save autotune settings"
+
+  autoload:
+    command: "autoload\n"
+    need_parse: false
+    prompts:
+      - "load autotune settings"
+
+  autoreset:
+    command: "autoreset\n"
+    need_parse: false
+    prompts:
+      - "disable autotune thresholds"
+
+  autostat:
+    command: "autostat\n"
+    need_parse: false
+    prompts:
+      - "show autotune status"
+
+  bcalib:
+    command: "bcalib{slot}\n"
+    need_parse: false
+    prompts:
+      - "backup calibration slot {slot}"
+
+  rcalib:
+    command: "rcalib{slot}\n"
+    need_parse: false
+    prompts:
+      - "restore calibration slot {slot}"
 
   set_color_selected:
     command: "c{r},{g},{b}\n"
