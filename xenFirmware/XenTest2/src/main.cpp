@@ -27,6 +27,8 @@ void handleAutoReset(float* params, int count);
 void handleAutoStat(float* params, int count);
 void handleBootDrift(float* params, int count);
 void handleDriftReset(float* params, int count);
+void handleNoiseLevel(float* params, int count);
+void handleNoiseReset(float* params, int count);
 void handleSaveCalibSlot(float* params, int count);
 void handleLoadCalibSlot(float* params, int count);
 
@@ -34,7 +36,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 86;
+static const int XEN_FW_VERSION = 90;
 
 static inline void mcpAckRaw(const char* raw, const char* cmd, const char* desc)
 {
@@ -104,6 +106,8 @@ static void setMuxDelayRamOnly(int us)
 }
 
 static void applyAutotuneSettingsOnBoot();
+static void computeNoiseCacheOnce();
+static void printNoiseCacheSummary();
 
 // --- Autotune run capture (RAM only; keep one run) ---
 static bool _autoHasRun = false;
@@ -558,6 +562,8 @@ Command commandTable[] = {
   {"autostat", handleAutoStat, "Show autotune threshold status"},
   {"bootdrift", handleBootDrift, "Print boot drift summary (cached)"},
   {"driftreset", handleDriftReset, "Re-measure boot drift and apply compensation"},
+  {"noiselevel", handleNoiseLevel, "Print noise level summary (cached)"},
+  {"noisereset", handleNoiseReset, "Re-measure noise level (and optional sweep)"},
   {"lconf", handleLoadConfig, "Load configuration (optional: program ID)"},
   {"sconf", handleSaveConfig, "Save configuration (optional: program ID)"},
   {"lcalib", handleLoadCalib, "Load calibration"},
@@ -598,6 +604,9 @@ void setup() {
 
   // Apply autotune thresholds + avg/sd if present.
   applyAutotuneSettingsOnBoot();
+
+  // Compute boot noise level under active avg/sd (cached; printed on demand or debug attach).
+  computeNoiseCacheOnce();
 
   setupLEDs(280);
   loadConfigurationCSV();
@@ -710,6 +719,9 @@ void updateDebugState()
       // Baseline compensation already happened in setupCalibration().
       extern void bootDriftPrintSummary();
       bootDriftPrintSummary();
+
+      // Print cached noiselevel summary on debug attach.
+      printNoiseCacheSummary();
     }
     else if (!connected && _debugMode) {        
       _debugMode      = false;
@@ -1036,6 +1048,142 @@ void handleDriftReset(float* params, int count)
 {
   (void)params; (void)count;
   driftReset();
+}
+
+// --- Noise level summary ---
+static bool _noiseHasCache = false;
+static float _noiseSigmaP95 = 0.0f;
+static int _noiseClass = 0; // 0=LOW 1=MEDIUM 2=HIGH
+
+static const char* noiseClassStr(int c)
+{
+  switch (c) {
+    case 0: return "LOW";
+    case 1: return "MEDIUM";
+    default: return "HIGH";
+  }
+}
+
+static int noiseClassify(float sigmaP95)
+{
+  if (sigmaP95 < 0.003f) return 0;
+  if (sigmaP95 < 0.010f) return 1;
+  return 2;
+}
+
+static void computeNoiseCacheOnce()
+{
+  // Measure noise quickly under current avg/sd.
+  scanNoise(200);
+
+  static float tmp[NUM_KEYS];
+  int n = 0;
+  for (int k = _fromKey; k <= _toKey; ++k) {
+    if (!_hasZero[k]) continue;
+    tmp[n++] = _noiseUnscaled[k];
+  }
+  if (n <= 0) {
+    _noiseHasCache = false;
+    _noiseSigmaP95 = 0.0f;
+    _noiseClass = 2;
+    return;
+  }
+  const int idx = (int)(0.95f * (n - 1));
+  for (int a = 0; a <= idx; ++a) {
+    int best = a;
+    for (int b = a + 1; b < n; ++b) if (tmp[b] < tmp[best]) best = b;
+    float t = tmp[a]; tmp[a] = tmp[best]; tmp[best] = t;
+  }
+  _noiseSigmaP95 = tmp[idx];
+  _noiseClass = noiseClassify(_noiseSigmaP95);
+  _noiseHasCache = true;
+}
+
+static void printNoiseCacheSummary()
+{
+  if (_outputFormat) {
+    beginJson("noiselevel");
+    printJsonKV("ok", _noiseHasCache ? 1 : 0);
+    printJsonKV("sigmaP95", _noiseSigmaP95);
+    printJsonKV("class", noiseClassStr(_noiseClass));
+    printJsonKV("avg", _measureAvgStandard);
+    printJsonKV("sd_us", _us_delay_after_mux, true);
+    endJson();
+  } else {
+    _println("noiselevel sigmaP95=%.6fV class=%s avg=%d sd_us=%d",
+            _noiseSigmaP95, noiseClassStr(_noiseClass), _measureAvgStandard, _us_delay_after_mux);
+  }
+}
+
+void handleNoiseLevel(float* params, int count)
+{
+  (void)params; (void)count;
+  // Cached summary only.
+  printNoiseCacheSummary();
+}
+
+void handleNoiseReset(float* params, int count)
+{
+  // Optional: noisereset or noisereset1 to print per-avg sweep.
+  const bool doSweep = (count >= 1) ? ((int)params[0] != 0) : false;
+
+  if (!doSweep) {
+    computeNoiseCacheOnce();
+    // Also print dynamics prognosis for current thresholds.
+    float oMin,oMax; int oMinK,oMaxK; int nonPos;
+    int sMin,sMax,sMinK,sMaxK,deadN;
+    computeDynamicsMetrics(oMin,oMax,oMinK,oMaxK,nonPos, sMin,sMax,sMinK,sMaxK,deadN);
+    printNoiseCacheSummary();
+    if (_outputFormat) {
+      beginJson("noiseprog");
+      printJsonKV("dynStepsMin", sMin);
+      printJsonKV("dynDeadN", deadN, true);
+      endJson();
+    } else {
+      _println("noiseprog dynStepsMin=%d dynDeadN=%d", sMin, deadN);
+    }
+    return;
+  }
+
+  const int avgs[] = {16, 32, 64, 128};
+  const int savedAvg = _measureAvgStandard;
+  const int savedSd = _us_delay_after_mux;
+
+  if (_outputFormat) {
+    beginJson("noisesweep");
+    printJsonKV("ok", 1);
+    printJsonKV("sd_us", savedSd, true);
+    endJson();
+  } else {
+    _println("noisesweep sd_us=%d", savedSd);
+  }
+
+  for (int i = 0; i < (int)(sizeof(avgs)/sizeof(avgs[0])); ++i) {
+    setAveragingRamOnly(avgs[i]);
+    computeNoiseCacheOnce();
+
+    float oMin,oMax; int oMinK,oMaxK; int nonPos;
+    int sMin,sMax,sMinK,sMaxK,deadN;
+    computeDynamicsMetrics(oMin,oMax,oMinK,oMaxK,nonPos, sMin,sMax,sMinK,sMaxK,deadN);
+
+    if (_outputFormat) {
+      beginJson("noise_trial");
+      printJsonKV("avg", _measureAvgStandard);
+      printJsonKV("sd_us", _us_delay_after_mux);
+      printJsonKV("sigmaP95", _noiseSigmaP95);
+      printJsonKV("class", noiseClassStr(_noiseClass));
+      printJsonKV("dynStepsMin", sMin);
+      printJsonKV("dynDeadN", deadN, true);
+      endJson();
+    } else {
+      _println("noise_trial avg=%d sd_us=%d sigmaP95=%.6fV class=%s dynStepsMin=%d deadN=%d",
+              _measureAvgStandard, _us_delay_after_mux, _noiseSigmaP95, noiseClassStr(_noiseClass), sMin, deadN);
+    }
+  }
+
+  // Restore
+  setAveragingRamOnly(savedAvg);
+  setMuxDelayRamOnly(savedSd);
 }
 
 void handleSetupLEDs(float* params, int count) {
