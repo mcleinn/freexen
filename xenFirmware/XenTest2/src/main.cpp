@@ -34,7 +34,7 @@ int _outputFormat = 0; // 0=human, 1=jsonl
 bool _diagActive = false;
 
 // Bump this on every firmware change that touches serial protocol or behavior.
-static const int XEN_FW_VERSION = 81;
+static const int XEN_FW_VERSION = 82;
 
 static inline void mcpAckRaw(const char* raw, const char* cmd, const char* desc)
 {
@@ -582,6 +582,12 @@ void loop() {
   if (_debugMode)
     checkSerial();
 
+  // If a host is connected in debug mode, default to paused operation.
+  // This prevents peak detect spam and allows interactive diagnostics.
+  if (_debugMode && (Serial && Serial.dtr()) && _mainLoopState == 3) {
+    _mainLoopState = 0;
+  }
+
   // Diagnostics/tests take over the device (LEDs, timing). Do not run normal scanning.
   if (_diagActive) {
     return;
@@ -634,9 +640,9 @@ void updateDebugState()
     if (connected && !_debugMode) {            
       _debugMode      = true;
 
-      // When debug is enabled (often after connecting later), suppress any
-      // running loop modes that spam serial (e.g. calibration/plot/noise).
-      // The user can explicitly re-enter a loop mode via commands.
+      // When debug is enabled (often after connecting later), immediately
+      // pause any running loop mode (including normal scanning). The user
+      // can explicitly re-enter a loop mode via commands.
       if (_mainLoopState != 2) {
         _mainLoopState = 0;
       }
